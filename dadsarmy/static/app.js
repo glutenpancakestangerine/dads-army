@@ -145,11 +145,13 @@
     if (n < 60) return Math.round(n / 7) + 'w left';
     return Math.round(n / 30.44) + 'mo left';
   }
-  function expState(s) {
+  // Days before its best-before that something counts as expiring soon: some categories (medicines, say) can warn earlier.
+  function warnDays(catId) { return ((S.settings.warn_by_cat || {})[catId]) || S.settings.warn_days; }
+  function expState(s, catId) {
     if (!s) return 'none';
     var n = daysUntil(s);
     if (n < 0) return 'bad';
-    if (n <= S.settings.warn_days) return 'warn';
+    if (n <= warnDays(catId)) return 'warn';
     return 'ok';
   }
   function ago(ts) {
@@ -201,18 +203,22 @@
     return null;
   }
   function total(it) { return it.batches.reduce(function (a, b) { return a + b.qty; }, 0); }
+  // Out-of-date stock doesn't count towards the target (it needs replacing), just as the Pi works it out.
   function info(it) {
-    var tot = total(it), soonest = null;
+    var tot = total(it), good = inDate(it), soonest = null;
     it.batches.forEach(function (b) {
       if (b.expiry && b.qty > 0 && (soonest === null || b.expiry < soonest)) soonest = b.expiry;
     });
     return {
       total: tot,
+      good: good,
+      old: Math.round((tot - good) * 1000) / 1000,
       soonest: soonest,
-      exp: soonest ? expState(soonest) : 'none',
-      low: it.target_qty > 0 && tot < it.target_qty,
-      out: tot <= 0,
-      short: Math.max(0, Math.round((it.target_qty - tot) * 1000) / 1000)
+      exp: soonest ? expState(soonest, it.category) : 'none',
+      low: it.target_qty > 0 && good < it.target_qty,
+      out: good <= 0,
+      none: tot <= 0,
+      short: Math.max(0, Math.round((it.target_qty - good) * 1000) / 1000)
     };
   }
   function locations() {
@@ -259,12 +265,25 @@
   }
   function checksDue() { return sortedChecks().filter(function (x) { return isDue(x.i); }).length; }
 
+  function petsWater(st) {
+    return (st.dogs || 0) * (st.water_per_dog || 0) + (st.cats || 0) * (st.water_per_cat || 0) +
+      (st.other_pets || 0) * (st.water_per_other_pet || 0);
+  }
+  function petsCount(st) { return (st.dogs || 0) + (st.cats || 0) + (st.other_pets || 0); }
+  function petsWords(st) {
+    var bits = [];
+    if (st.dogs) bits.push(st.dogs + ' dog' + (st.dogs === 1 ? '' : 's'));
+    if (st.cats) bits.push(st.cats + ' cat' + (st.cats === 1 ? '' : 's'));
+    if (st.other_pets) bits.push(st.other_pets + ' other pet' + (st.other_pets === 1 ? '' : 's'));
+    return bits.length > 1 ? bits.slice(0, -1).join(', ') + ' and ' + bits[bits.length - 1] : bits.join('');
+  }
   function readiness() {
     var st = S.settings;
     var people = st.adults + st.children;
     var kcalDay = st.adults * st.kcal_adult + st.children * st.kcal_child;
-    var waterDay = people * st.water_per_person;
-    var r = { people: people, kcalDay: kcalDay, waterDay: waterDay, kcal: 0, kcalOld: 0, litres: 0, litresOld: 0, noKcal: 0 };
+    var petWater = petsWater(st);
+    var waterDay = people * st.water_per_person + petWater;
+    var r = { petWater: petWater, people: people, kcalDay: kcalDay, waterDay: waterDay, kcal: 0, kcalOld: 0, litres: 0, litresOld: 0, noKcal: 0 };
     S.items.forEach(function (it) {
       var food = it.category === 'food', water = it.category === 'water' && it.litres_per_unit > 0;
       if (food && !(it.kcal_per_unit > 0)) return;
@@ -284,7 +303,7 @@
     r.waterOldDays = waterDay > 0 ? r.litresOld / waterDay : 0;
     var kit = S.items.filter(function (it) { return it.target_qty > 0 && it.category !== 'food' && it.category !== 'water'; });
     r.kit = kit.length;
-    r.kitPct = kit.length ? kit.reduce(function (a, it) { return a + Math.min(1, total(it) / it.target_qty); }, 0) / kit.length : 0;
+    r.kitPct = kit.length ? kit.reduce(function (a, it) { return a + Math.min(1, inDate(it) / it.target_qty); }, 0) / kit.length : 0;
     r.hold = Math.min(r.foodDays, r.waterDays);
     r.limit = r.foodDays < r.waterDays ? 'food' : r.waterDays < r.foodDays ? 'water' : '';
     // Things with a daily use, shortest-lasting first.
@@ -310,7 +329,7 @@
     return fetch(path, opt).then(function (res) {
       setOnline(true);
       return res.json().catch(function () { return {}; }).then(function (data) {
-        if (!res.ok) throw new Error(data.error || ('Error ' + res.status));
+        if (!res.ok) { var err = new Error(data.error || ('Error ' + res.status)); err.code = data.code; err.status = res.status; throw err; }
         return data;
       });
     }, function () {
@@ -406,10 +425,180 @@
       '<span class="tile-label">' + label + '</span></button>';
   }
 
+  // ------------------------------------------------------------------
+  // Trends: how ready the household has been, day by day (from the Pi's daily history)
+  // ------------------------------------------------------------------
+  var HIST = { days: 90, metric: 'days', rows: null, at: 0, loadedDays: 0, loading: false };
+  try {
+    HIST.days = +localStorage.getItem('da-trend-days') || 90;
+    HIST.metric = localStorage.getItem('da-trend-metric') || 'days';
+  } catch (e) { /* defaults */ }
+  var CHARTS = {};
+  function loadHistory(force) {
+    if (HIST.loading) return;
+    if (!force && HIST.rows && HIST.loadedDays === HIST.days && Date.now() - HIST.at < 10 * 60000) return;
+    HIST.loading = true;
+    api('GET', 'api/history?days=' + HIST.days).then(function (res) {
+      HIST.rows = res.rows; HIST.at = Date.now(); HIST.loadedDays = HIST.days; HIST.loading = false;
+      var box = $('#trends');
+      if (box) box.outerHTML = trendsCard();
+    }, function () { HIST.loading = false; });
+  }
+  function niceMax(v) {
+    if (!(v > 0)) return 1;
+    var p = Math.pow(10, Math.floor(Math.log(v) / Math.LN10)), n = v / p;
+    return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * p;
+  }
+  function shortDate(s) { return parseYmd(s).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }); }
+  // A line chart in SVG: thin lines, a recessive grid, labels at the line ends, and a crosshair with the
+  // values when you point at it (see chartHover). Values below zero are "not known" and leave a gap.
+  function lineChart(id, rows, series, opt) {
+    // Drawn at the size it's shown, so the text stays the size of the text around it.
+    var W = opt.width || 640, H = Math.round(Math.max(190, Math.min(260, W * 0.42))), L = 36, R = 88, T = 14, B = 26;
+    var pw = W - L - R, ph = H - T - B;
+    var t0 = parseYmd(rows[0].day).getTime(), t1 = parseYmd(rows[rows.length - 1].day).getTime();
+    var span = Math.max(1, t1 - t0);
+    var xs = rows.map(function (r) { return L + pw * (parseYmd(r.day).getTime() - t0) / span; });
+    var hi = opt.max || niceMax(Math.max.apply(null, [opt.target || 0].concat(rows.map(function (r) {
+      return Math.max.apply(null, series.map(function (s) { return r[s.key] > 0 ? r[s.key] : 0; }));
+    }))) * 1.08);
+    var y = function (v) { return T + ph - ph * Math.min(v, hi) / hi; };
+    var g = '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' + esc(opt.label) + '">';
+    for (var k = 0; k <= 4; k++) {
+      var v = hi * k / 4, yy = y(v);
+      g += '<line class="grid" x1="' + L + '" x2="' + (W - R) + '" y1="' + yy + '" y2="' + yy + '"/>' +
+        '<text class="axis" x="' + (L - 6) + '" y="' + (yy + 4) + '" text-anchor="end">' + esc(fq(Math.round(v * 10) / 10)) + '</text>';
+    }
+    var ticks = rows.length > 2 ? [0, Math.floor((rows.length - 1) / 2), rows.length - 1] : [0, rows.length - 1];
+    ticks.forEach(function (i, n) {
+      g += '<text class="axis" x="' + xs[i] + '" y="' + (H - 8) + '" text-anchor="' + (n === 0 ? 'start' : n === ticks.length - 1 ? 'end' : 'middle') + '">' + esc(shortDate(rows[i].day)) + '</text>';
+    });
+    var ends = [];
+    if (opt.target) {
+      g += '<line class="target" x1="' + L + '" x2="' + (W - R) + '" y1="' + y(opt.target) + '" y2="' + y(opt.target) + '"/>';
+      ends.push({ y: y(opt.target), x: W - R, text: 'Target ' + fq(opt.target), cls: 'axis tgt' });
+    }
+    series.forEach(function (s) {
+      var d = '', pen = false, last = null;
+      rows.forEach(function (r, i) {
+        var v = r[s.key];
+        if (v === null || v === undefined || v < 0) { pen = false; return; }
+        d += (pen ? 'L' : 'M') + xs[i].toFixed(1) + ' ' + y(v).toFixed(1) + ' ';
+        pen = true; last = { x: xs[i], y: y(v), v: v };
+      });
+      g += '<path class="line" style="stroke:var(' + s.color + ')" d="' + d + '"/>';
+      if (rows.length < 40) {
+        rows.forEach(function (r, i) {
+          if (r[s.key] >= 0) g += '<circle class="pt" style="fill:var(' + s.color + ')" cx="' + xs[i].toFixed(1) + '" cy="' + y(r[s.key]).toFixed(1) + '" r="3"/>';
+        });
+      }
+      if (last) ends.push({ y: last.y, x: last.x, text: s.name + ' ' + fq(Math.round(last.v * 10) / 10) + (opt.unit || ''), color: s.color });
+    });
+    // Labels at the right-hand end of each line (and the target), nudged apart so none overlap.
+    ends.sort(function (a, b) { return a.y - b.y; });
+    for (var e = 1; e < ends.length; e++) if (ends[e].y - ends[e - 1].y < 16) ends[e].y = ends[e - 1].y + 16;
+    var over = ends.length ? ends[ends.length - 1].y - (T + ph + 4) : 0;
+    if (over > 0) ends.forEach(function (en) { en.y -= over; });
+    ends.forEach(function (en) {
+      g += '<text class="' + (en.cls || 'end') + '" x="' + (W - R + 8) + '" y="' + (en.y + 4) + '">' + esc(en.text) + '</text>';
+    });
+    g += '<line class="xhair" x1="0" x2="0" y1="' + T + '" y2="' + (T + ph) + '" hidden/>' +
+      '<rect class="chart-hit" data-chart="' + id + '" x="' + L + '" y="' + T + '" width="' + pw + '" height="' + ph + '"/></svg>';
+    CHARTS[id] = { xs: xs, rows: rows, series: series, unit: opt.unit || '', W: W };
+    return '<div class="chart-wrap" id="' + id + '">' + g + '<div class="chart-tip" hidden></div></div>';
+  }
+  // The width the chart will have: the card's, which on wide screens is one of the columns.
+  function chartWidth() {
+    var v = $('#view'), w = 360;
+    if (v) { var cs = getComputedStyle(v); w = v.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight); }
+    if (isWide()) {
+      var n = Math.max(1, Math.min(3, Math.floor((w + 18) / 398)));
+      w = (w - 18 * (n - 1)) / n;
+    }
+    return Math.max(260, Math.round(w - 34));   // the card's padding and border
+  }
+  var chartResize = null;
+  window.addEventListener('resize', function () {
+    clearTimeout(chartResize);
+    chartResize = setTimeout(function () { var tb = $('#trends'); if (tb && HIST.rows) tb.outerHTML = trendsCard(); }, 250);
+  });
+  function chartHover(e) {
+    var hit = e.target.closest && e.target.closest('.chart-hit');
+    $$('.chart-wrap').forEach(function (w) {
+      if (hit && w.contains(hit)) return;
+      var t = $('.chart-tip', w); if (t) t.hidden = true;
+      var x = $('.xhair', w); if (x) x.setAttribute('hidden', '');
+    });
+    if (!hit) return;
+    var c = CHARTS[hit.dataset.chart], wrap = hit.closest('.chart-wrap'), svg = hit.ownerSVGElement;
+    if (!c || !wrap || !svg) return;
+    var box = svg.getBoundingClientRect(), sx = (e.clientX - box.left) * c.W / box.width;
+    var best = 0;
+    c.xs.forEach(function (x, i) { if (Math.abs(x - sx) < Math.abs(c.xs[best] - sx)) best = i; });
+    var r = c.rows[best], line = $('.xhair', wrap), tip = $('.chart-tip', wrap);
+    line.setAttribute('x1', c.xs[best]); line.setAttribute('x2', c.xs[best]); line.removeAttribute('hidden');
+    tip.innerHTML = '<b>' + esc(fmtDate(r.day)) + '</b>' + c.series.map(function (s) {
+      var v = r[s.key];
+      return '<span><i style="background:var(' + s.color + ')"></i>' + esc(s.name) + ' <b>' + (v >= 0 ? esc(fq(Math.round(v * 10) / 10)) + esc(c.unit) : '–') + '</b></span>';
+    }).join('');
+    tip.hidden = false;
+    var px = c.xs[best] * box.width / c.W;
+    tip.style.left = Math.max(0, Math.min(box.width - tip.offsetWidth, px - tip.offsetWidth / 2)) + 'px';
+  }
+  function trendsCard() {
+    loadHistory();
+    var rows = HIST.rows, m = HIST.metric;
+    var html = '<section class="card trends" id="trends"><div class="card-head"><h2>Trends</h2>' +
+      '<div class="seg small" role="group" aria-label="What to show">' + [['days', 'Days you could last'], ['res', 'Resilience']].map(function (x) {
+        return '<button data-act="trend-metric" data-val="' + x[0] + '" aria-pressed="' + (m === x[0]) + '">' + x[1] + '</button>';
+      }).join('') + '</div></div>';
+    if (!rows) return html + '<p class="small muted">Loading…</p></section>';
+    var useful = rows.filter(function (r) { return m === 'res' ? r.resilience >= 0 : r.food_days >= 0 || r.water_days >= 0; });
+    if (useful.length < 2) {
+      return html + '<p class="small muted">The charts fill in a day at a time: there\'s ' + (useful.length ? 'one day' : 'nothing') +
+        ' so far. Come back in a day or two.</p></section>';
+    }
+    var series = m === 'res'
+      ? [{ key: 'resilience', name: 'Resilience', color: '--series-1' }]
+      : [{ key: 'water_days', name: 'Water', color: '--series-1' }, { key: 'food_days', name: 'Food', color: '--series-2' }];
+    if (m !== 'res') {
+      html += '<div class="legend">' + series.map(function (s) { return '<span><i style="background:var(' + s.color + ')"></i>' + s.name + '</span>'; }).join('') +
+        '<span><i class="dash"></i>Target</span></div>';
+    }
+    html += lineChart('chart-' + m, useful, series, m === 'res'
+      ? { label: 'Resilience, per cent ready, by day', max: 100, unit: '%', width: chartWidth() }
+      : { label: 'Days the food and water would last, by day', target: S.settings.target_days, unit: ' d', width: chartWidth() });
+    html += '<div class="chips trend-range">' + [[30, '30 days'], [90, '90 days'], [365, '1 year'], [1830, 'All']].map(function (d) {
+      return '<button class="chip" data-act="trend-days" data-val="' + d[0] + '" aria-pressed="' + (HIST.days === d[0]) + '">' + d[1] + '</button>';
+    }).join('') + '</div>';
+    html += '<details class="trend-table"><summary>Show as a table</summary><table class="live-table"><thead><tr><th>Day</th>' +
+      series.map(function (s) { return '<th class="num">' + esc(s.name) + '</th>'; }).join('') + '</tr></thead><tbody>' +
+      useful.slice().reverse().map(function (r) {
+        return '<tr><td>' + esc(fmtDate(r.day)) + '</td>' + series.map(function (s) {
+          return '<td class="num">' + (r[s.key] >= 0 ? esc(fq(Math.round(r[s.key] * 10) / 10)) + (m === 'res' ? '%' : '') : '–') + '</td>';
+        }).join('') + '</tr>';
+      }).join('') + '</tbody></table></details>';
+    return html + '</section>';
+  }
+
+  // Pets: their food lasts as long as the pet food with a daily use (their water is in the water meter).
+  function petMeter(target) {
+    var st = S.settings, p = S.pets;
+    if (!petsCount(st) || !p) return '';
+    if (p.food_days === null || p.food_days === undefined) {
+      return '<div class="meter-plain"><span class="meter-label">🐾 Pet food</span> <span class="small muted">' + esc(petsWords(st)) +
+        '. Set <b>Used a day</b> on their food to see how long it lasts' +
+        (S.items.some(function (it) { return it.category === 'pets'; }) ? '' : ', or <button class="link" data-act="seed">add pet food from the starter list</button>') + '.</span></div>';
+    }
+    var who = S.items.filter(function (it) { return it.name === p.food_runs_out_first; })[0];
+    return meter('🐾 Pet food', fmtDays(p.food_days) + ' of ' + target + ' days', p.food_days / target,
+      esc(petsWords(st)) + (who ? ' · <button class="link" data-act="open" data-id="' + who.id + '">' + esc(who.name) + '</button> runs out first' : ''));
+  }
+
   function renderSitrep(el) {
-    if (!S.items.length) { el.innerHTML = levelCard() + warnCard(false) + emptyCard() + resilienceCard(); return; }
+    if (!S.items.length) { el.innerHTML = levelCard() + warnCard(false) + liveCard() + emptyCard() + resilienceCard(); return; }
     var st = S.settings, r = readiness(), target = st.target_days;
-    var html = levelCard() + dashNote() + warnCard(false) + resilienceCard();
+    var html = levelCard() + dashNote() + warnCard(false) + liveCard() + resilienceCard();
 
     // Hero: how long could we hold out?
     if (r.people === 0) {
@@ -420,7 +609,8 @@
       var foodNote = nf0.format(r.kcal) + ' kcal stored · ' + nf0.format(r.kcalDay) + ' needed a day';
       if (r.foodOldDays >= 0.1) foodNote += ' · +' + fmtDays(r.foodOldDays) + ' days in expired stock';
       if (r.noKcal) foodNote += ' · ' + r.noKcal + ' item' + (r.noKcal === 1 ? '' : 's') + ' with no calories set';
-      var waterNote = fq(Math.round(r.litres * 10) / 10) + ' L stored · ' + fq(r.waterDay) + ' L needed a day';
+      var waterNote = fq(Math.round(r.litres * 10) / 10) + ' L stored · ' + fq(Math.round(r.waterDay * 10) / 10) + ' L needed a day' +
+        (r.petWater > 0 ? ' (' + fq(Math.round(r.petWater * 10) / 10) + ' L for the pets)' : '');
       if (r.waterOldDays >= 0.1) waterNote += ' · +' + fmtDays(r.waterOldDays) + ' days past best-before';
       var sup = r.supplies[0], supNote = '';
       if (sup) {
@@ -437,8 +627,9 @@
         meter('🥫 Food', fmtDays(r.foodDays) + ' of ' + target + ' days', r.foodDays / target, foodNote) +
         meter('💧 Water', fmtDays(r.waterDays) + ' of ' + target + ' days', r.waterDays / target, waterNote) +
         (sup ? meter('⏳ Daily supplies', fmtDays(sup.days) + ' of ' + target + ' days', sup.days / target, supNote) : '') +
-        '</div></section>';
+        petMeter(target) + '</div></section>';
     }
+    html += trendsCard();
 
     // Alert tiles
     var cnt = { bad: 0, warn: 0, low: 0 };
@@ -449,7 +640,7 @@
     });
     html += '<div class="tiles">' +
       tile(cnt.bad, 'Expired', 'bad', 'expired') +
-      tile(cnt.warn, 'Expiring in ' + st.warn_days + ' days', 'warn', 'soon') +
+      tile(cnt.warn, Object.keys(st.warn_by_cat || {}).length ? 'Expiring soon' : 'Expiring in ' + st.warn_days + ' days', 'warn', 'soon') +
       tile(cnt.low, 'Below target', 'warn', 'low') + '</div>';
 
     // Use first
@@ -458,13 +649,13 @@
       it.batches.forEach(function (b) { if (b.expiry && b.qty > 0) upcoming.push({ it: it, b: b }); });
     });
     upcoming.sort(function (a, b) { return a.b.expiry < b.b.expiry ? -1 : a.b.expiry > b.b.expiry ? 1 : 0; });
-    var urgent = upcoming.filter(function (x) { return expState(x.b.expiry) !== 'ok'; });
+    var urgent = upcoming.filter(function (x) { return expState(x.b.expiry, x.it.category) !== 'ok'; });
     var showList = (urgent.length ? urgent : upcoming).slice(0, 6);
     if (showList.length) {
       html += '<section class="card flush"><div class="card-head"><h2>' + (urgent.length ? 'Use these first' : 'Next to expire') + '</h2>' +
         (upcoming.length > showList.length ? '<button class="link" data-act="go" data-show="all" data-sort="expiry">See all</button>' : '') + '</div><div class="list">';
       showList.forEach(function (x) {
-        var es = expState(x.b.expiry);
+        var es = expState(x.b.expiry, x.it.category);
         html += '<div class="li"><span class="li-ico">' + cat(x.it.category).icon + '</span>' +
           '<button class="li-main" data-act="open" data-id="' + x.it.id + '"><div class="li-title">' + esc(x.it.name) + '</div>' +
           '<div class="li-sub"><span class="badge ' + (es === 'ok' ? 'plain' : es) + '">' + esc(expiryWords(x.b.expiry)) + '</span>' +
@@ -488,7 +679,7 @@
       var its = S.items.filter(function (it) { return it.category === c.id; });
       if (!its.length) return;
       var tg = its.filter(function (it) { return it.target_qty > 0; });
-      var met = tg.filter(function (it) { return total(it) >= it.target_qty; }).length;
+      var met = tg.filter(function (it) { return inDate(it) >= it.target_qty; }).length;
       var pct = tg.length ? met / tg.length : null;
       html += '<button class="li" data-act="cat-go" data-cat="' + c.id + '"><span class="li-ico">' + c.icon + '</span>' +
         '<span class="li-main"><span class="li-title">' + esc(c.label) + '</span>' +
@@ -598,7 +789,7 @@
     var badges = '';
     if (i.exp === 'bad') badges += '<span class="badge bad">Expired</span>';
     else if (i.exp === 'warn') badges += '<span class="badge warn">' + esc(shortLeft(i.soonest)) + '</span>';
-    if (i.out && it.target_qty > 0) badges += '<span class="badge bad">Out</span>';
+    if (i.out && it.target_qty > 0) badges += '<span class="badge bad">' + (i.none ? 'Out' : 'Replace') + '</span>';
     else if (i.low) badges += '<span class="badge warn">Low</span>';
     var locs = {};
     it.batches.forEach(function (b) { if (b.location) locs[b.location] = 1; });
@@ -611,6 +802,7 @@
       amount = '<b>' + fq(i.total) + '</b>' + (it.target_qty > 0 ? ' of ' + fq(it.target_qty) : '') +
         (it.unit ? ' ' + esc(plural(it.unit, it.target_qty > 0 ? it.target_qty : i.total)) : '');
     }
+    if (i.old > 0 && it.target_qty > 0) amount += ' <span class="old">(' + fq(i.old) + ' out of date)</span>';
     var left = daysLeft(it);
     var lasts = left > 0 ? '<span>· lasts ' + esc(lastsWords(left)) + '</span>' : '';
     var body = (showIcon ? '<span class="row-ico">' + cat(it.category).icon + '</span>' : '') +
@@ -618,16 +810,69 @@
       '<span class="row-sub"><span>' + amount + '</span>' + (where ? '<span>· ' + esc(where) + '</span>' : '') + lasts + badges + '</span></span>';
     if (SEL) {   // picking items to delete: the whole row is a tick box
       var on = !!SEL[it.id];
-      return '<div class="row' + (on ? ' picked' : '') + (i.out ? ' is-out' : '') + '">' +
+      return '<div class="row' + (on ? ' picked' : '') + (i.none ? ' is-out' : '') + '">' +
         '<button class="row-main" role="checkbox" aria-checked="' + on + '" data-act="sel-toggle" data-id="' + it.id + '">' +
         '<span class="box">' + ICON.check + '</span>' + body + '</button></div>';
     }
-    return '<div class="row' + (i.out ? ' is-out' : '') + '">' +
+    return '<div class="row' + (i.none ? ' is-out' : '') + '">' +
       '<button class="row-main" data-act="open" data-id="' + it.id + '">' + body + '</button>' +
       '<div class="row-ctl">' +
-      '<button class="qbtn" data-act="use" data-id="' + it.id + '" aria-label="Use one ' + esc(it.name) + '"' + (i.out ? ' disabled' : '') + '>' + ICON.minus + '</button>' +
+      '<button class="qbtn" data-act="use" data-id="' + it.id + '" aria-label="Use one ' + esc(it.name) + '"' + (i.none ? ' disabled' : '') + '>' + ICON.minus + '</button>' +
       '<button class="qbtn add" data-act="stock" data-id="' + it.id + '" aria-label="Add ' + esc(it.name) + '">' + ICON.plus + '</button>' +
       '</div></div>';
+  }
+
+  // Wall tablets and wide screens: the stores as a table, sortable by its column headings.
+  var WIDE = window.matchMedia ? window.matchMedia('(min-width: 900px)') : { matches: false };
+  function isWide() { return WIDE.matches; }
+  function tableRow(it, i, showCat) {
+    var badges = '';
+    if (i.exp === 'bad') badges += '<span class="badge bad">Expired</span>';
+    else if (i.exp === 'warn') badges += '<span class="badge warn">' + esc(shortLeft(i.soonest)) + '</span>';
+    if (i.out && it.target_qty > 0) badges += '<span class="badge bad">' + (i.none ? 'Out' : 'Replace') + '</span>';
+    else if (i.low) badges += '<span class="badge warn">Low</span>';
+    if (!badges && it.target_qty > 0) badges = '<span class="badge ok">At target</span>';
+    var locs = {};
+    it.batches.forEach(function (b) { if (b.location) locs[b.location] = 1; });
+    var lk = Object.keys(locs);
+    var left = daysLeft(it), use = (S.usage || {})[String(it.id)];
+    var lasts = left > 0 ? lastsWords(left) : left === 0 ? 'Run out' : use && use.lasts_days != null ? lastsWords(use.lasts_days) + ' at your rate' : '';
+    var unit = isMoney(it.unit) ? '' : ' ' + plural(it.unit, i.total);
+    var qty = (isMoney(it.unit) ? it.unit : '') + fq(i.total) + (it.unit && !isMoney(it.unit) ? unit : '');
+    return '<tr class="' + (i.none ? 'is-out' : '') + '">' +
+      '<td class="t-name"><button data-act="open" data-id="' + it.id + '">' + (showCat ? '' : '<span class="t-ico">' + cat(it.category).icon + '</span>') +
+      esc(it.name) + '</button></td>' +
+      (showCat ? '' : '<td class="t-cat">' + esc(cat(it.category).label) + '</td>') +
+      '<td class="num"><b>' + esc(qty) + '</b>' + (i.old > 0 ? '<span class="old"> (' + fq(i.old) + ' old)</span>' : '') + '</td>' +
+      '<td class="num">' + (it.target_qty > 0 ? esc(fq(it.target_qty)) : '–') + '</td>' +
+      '<td>' + (i.soonest ? esc(fmtDate(i.soonest)) : '<span class="muted">–</span>') + '</td>' +
+      '<td>' + (lk.length ? esc(lk.length === 1 ? lk[0] : lk.join(', ')) : '<span class="muted">–</span>') + '</td>' +
+      '<td>' + (lasts ? esc(lasts) : '<span class="muted">–</span>') + '</td>' +
+      '<td class="t-badges">' + badges + '</td>' +
+      '<td class="t-ctl"><button class="qbtn" data-act="use" data-id="' + it.id + '" aria-label="Use one ' + esc(it.name) + '"' + (i.none ? ' disabled' : '') + '>' + ICON.minus + '</button>' +
+      '<button class="qbtn add" data-act="stock" data-id="' + it.id + '" aria-label="Add ' + esc(it.name) + '">' + ICON.plus + '</button></td></tr>';
+  }
+  function tableHtml(list) {
+    var grouped = F.sort === 'category';
+    function head(key, label, cls) {
+      var on = F.sort === key || (key === 'name' && grouped);
+      return '<th' + (cls ? ' class="' + cls + '"' : '') + (key ? ' aria-sort="' + (F.sort === key ? 'ascending' : 'none') + '"' : '') + '>' +
+        (key ? '<button data-act="sort" data-sort="' + key + '"' + (on ? ' class="on"' : '') + '>' + label + '</button>' : label) + '</th>';
+    }
+    var cols = grouped ? 8 : 9;
+    var h = '<div class="table-wrap"><table class="stock-table"><thead><tr>' + head(grouped ? 'category' : 'name', 'Item') +
+      (grouped ? '' : head('category', 'Category')) + head('', 'In stock', 'num') + head('', 'Target', 'num') +
+      head('expiry', 'Best before') + head('', 'Where') + head('', 'Lasts') + head('short', 'Status') + '<th class="t-ctl"></th></tr></thead><tbody>';
+    var cur = null;
+    list.forEach(function (x) {
+      if (grouped && x.it.category !== cur) {
+        cur = x.it.category;
+        var n = list.filter(function (y) { return y.it.category === cur; }).length;
+        h += '<tr class="group"><td colspan="' + cols + '">' + cat(cur).icon + ' ' + esc(cat(cur).label) + ' <span class="n">' + n + '</span></td></tr>';
+      }
+      h += tableRow(x.it, x.i, grouped);
+    });
+    return h + '</tbody></table></div>';
   }
 
   function renderStoreList() {
@@ -648,7 +893,9 @@
       (SEL ? '<button class="link" id="selAll" data-act="sel-all"></button>'
         : '<button class="link" data-act="sel-start">' + ICON.trash + ' Select to delete</button>') +
       '</div><div class="card flush">';
-    if (F.sort === 'category') {
+    if (isWide() && !SEL) {
+      html += tableHtml(list);
+    } else if (F.sort === 'category') {
       var cur = null;
       list.forEach(function (x) {
         if (x.it.category !== cur) {
@@ -761,7 +1008,8 @@
           html += '<div class="group-head">' + cat(cur).icon + ' ' + esc(cat(cur).label) + '</div>';
         }
         html += '<div class="li"><button class="li-main" data-act="open" data-id="' + x.it.id + '"><div class="li-title">' + esc(x.it.name) + '</div>' +
-          '<div class="need">Get <b>' + esc(qu(x.i.short, x.it.unit)) + '</b> · have ' + esc(fq(x.i.total)) + ' of ' + esc(fq(x.it.target_qty)) +
+          '<div class="need">Get <b>' + esc(qu(x.i.short, x.it.unit)) + '</b> · have ' + esc(fq(x.i.good)) + ' of ' + esc(fq(x.it.target_qty)) +
+          (x.i.old > 0 ? ' · ' + esc(fq(x.i.old)) + ' out of date' : '') +
           (x.it.price > 0 ? ' · ' + esc(money(x.i.short * x.it.price)) : '') + '</div>' +
           (ticked.indexOf(x.it.id) >= 0 ? '<span class="badge ok ha-tick">' + ICON.check + ' Ticked off in Home Assistant</span>' : '') + '</button>' +
           '<button class="btn small" data-act="stock" data-id="' + x.it.id + '" data-qty="' + x.i.short + '">Got it</button></div>';
@@ -994,9 +1242,12 @@
   // ------------------------------------------------------------------
   // Warnings: Met Office, floods, Emergency Alerts, GDACS, UKHSA, WHO
   // ------------------------------------------------------------------
-  var WARN_ICON = { weather: '🌦️', flood: '🌊', alert: '📢', disaster: '🌍', fire: '🔥', news: '🩺' };
+  var WARN_ICON = { weather: '🌦️', flood: '🌊', alert: '📢', disaster: '🌍', fire: '🔥', news: '🩺',
+    river: '🏞️', power: '🔌', grid: '⚡', gas: '🔥', air: '🌫️', space: '☀️', money: '💷' };
   var SRC_NAME = { metoffice: 'Met Office', floods: 'Environment Agency', govalerts: 'GOV.UK', gdacs: 'GDACS', fires: 'NASA FIRMS',
-    ukhsa: 'UKHSA', who: 'WHO' };
+    ukhsa: 'UKHSA', who: 'WHO', rivers: 'Environment Agency', power: 'Power networks', grid: 'NESO', gas: 'National Gas',
+    air: 'Defra UK-AIR', space: 'NOAA', pound: 'Bank of England' };
+  var LIVE_KEYS = ['rivers', 'power', 'grid', 'gas', 'air', 'space', 'pound'];
   function W() {
     return S.warnings || { on: false, items: [], news: [], sources: {}, config: { sources: {} }, regions: [], source_list: [] };
   }
@@ -1074,6 +1325,88 @@
     return html + '</section>';
   }
 
+  // The wider picture: one line for each live feed (worked out on the Pi), green, amber or red.
+  function liveCard() {
+    var w = W(), rows = w.live_rows || [];
+    if (!w.on || !rows.length) return '';
+    return '<section class="card flush live-card"><div class="card-head"><h2>The wider picture</h2>' +
+      '<button class="link" data-act="live-open">More</button></div><div class="list">' +
+      rows.map(function (r) {
+        return '<button class="li live-row" data-state="' + r.state + '" data-act="live-open" data-key="' + r.key + '">' +
+          '<span class="li-ico">' + r.emoji + '</span><span class="li-main"><span class="li-title">' + esc(r.name) + '</span>' +
+          '<span class="li-sub">' + esc(r.text) + '</span></span><span class="live-dot" aria-label="' +
+          ({ good: 'Fine', warn: 'Worth watching', bad: 'Serious' }[r.state] || '') + '"></span></button>';
+      }).join('') + '</div></section>';
+  }
+
+  function liveDetail(key, r) {
+    var h = '';
+    if (key === 'rivers') {
+      if (!r.stations.length) return '<p class="small muted">No river gauges within 10 km of home. The Environment Agency\'s gauges cover England.</p>';
+      h += '<table class="live-table"><thead><tr><th>Gauge</th><th>Level</th><th>Usual</th><th>Now</th></tr></thead><tbody>' +
+        r.stations.map(function (x) {
+          return '<tr data-state="' + (x.state === 'very_high' ? 'bad' : x.state === 'high' ? 'warn' : 'good') + '"><td><a href="' + esc(x.url) +
+            '" target="_blank" rel="noopener noreferrer">' + esc(x.where) + '</a><br><span class="small muted">' + esc(fq(x.km)) + ' km ' + esc(x.dir) + '</span></td>' +
+            '<td class="num">' + esc(fq(x.level)) + ' m</td><td class="num">' + (x.high != null ? esc(fq(x.low != null ? x.low : 0)) + '–' + esc(fq(x.high)) + ' m' : '–') + '</td>' +
+            '<td>' + esc({ very_high: 'Very high', high: 'High', normal: 'Normal', low: 'Low', unknown: '–' }[x.state]) +
+            (x.trend !== 'steady' ? ', ' + esc(x.trend) : '') + '</td></tr>';
+        }).join('') + '</tbody></table>' +
+        '<p class="small muted">“Usual” is the range the river is in most of the time. Rising or falling compares the level with 2 to 6 hours ago.</p>';
+    } else if (key === 'power') {
+      h += r.cuts.length ? '<div class="list">' + r.cuts.map(function (c) {
+        return '<div class="li"><span class="li-ico">' + (c.planned ? '🛠️' : '🔌') + '</span><span class="li-main"><span class="li-title wrap">' + esc(c.text) + '</span>' +
+          '<span class="li-sub">' + esc(c.dno) + (c.customers ? ' · ' + c.customers + ' home' + (c.customers === 1 ? '' : 's') : '') + '</span></span></div>';
+      }).join('') + '</div>' : '<p class="small muted">No power cuts reported within 10 km.</p>';
+      h += '<p class="small muted">Power cut? Call <b>105</b>, free from any phone, to report it or get updates. Covers UK Power Networks, National Grid, SSEN and Northern Powergrid; ' +
+        'SP Energy Networks and Electricity North West don\'t publish theirs without an account.</p>';
+    } else if (key === 'grid') {
+      h += (r.status === 'normal' ? '<p>' + esc(r.text) + '</p>' : '') + '<p class="small muted">NESO runs Britain\'s electricity system. A margin or capacity market notice asks power stations for more; ' +
+        'a warning of demand control means planned rota power cuts may be needed. None of these have meant power cuts in recent years.</p>';
+    } else if (key === 'gas') {
+      h += '<p>Britain\'s gas storage is <b>' + esc(fq(r.pct)) + '% full</b> (' + esc(fq(r.gwh)) + ' GWh)' +
+        (r.year_ago_pct != null ? ', against ' + esc(fq(r.year_ago_pct)) + '% this time last year' : '') + '.</p>' +
+        (r.draw_gwh_day != null ? '<p>Over the last two weeks it has ' + (r.draw_gwh_day >= 0 ? 'gone down' : 'gone up') + ' by about ' + esc(fq(Math.abs(Math.round(r.draw_gwh_day)))) + ' GWh a day' +
+          (r.year_ago_draw != null ? ', against ' + esc(fq(Math.round(r.year_ago_draw))) + ' a year ago' : '') + '.</p>' : '') +
+        '<p class="small muted">Storage is a small part of Britain\'s gas: most comes from the North Sea, Norway and shipped-in LNG. Dads Army warns if it\'s emptying much faster than last year, or nearly empty in winter.</p>';
+    } else if (key === 'air') {
+      h += r.index ? '<p>Air pollution is <b>' + esc(r.band.toLowerCase()) + '</b> (index ' + r.index + ' of 10) at ' + esc(r.site) + ', ' + esc(fq(r.km)) + ' km away.</p>' : '';
+      if ((r.forecast || []).length) {
+        h += '<div class="chips">' + r.forecast.map(function (f, i) {
+          return '<span class="chip static" data-band="' + esc(f.band) + '">' + esc(i ? f.day : 'Today') + ': ' + esc(f.band) + ' (' + f.index + ')</span>';
+        }).join('') + '</div>';
+      }
+      h += '<p class="small muted">Defra\'s Daily Air Quality Index: 1–3 low, 4–6 moderate, 7–9 high, 10 very high. When it\'s high, people with heart or lung conditions should do less outdoors.</p>';
+    } else if (key === 'space') {
+      h += '<p>Now: <b>' + esc(r.text) + '</b>. Next three days: ' + esc(r.next_text.charAt(0).toLowerCase() + r.next_text.slice(1)) + '.</p>' +
+        '<p class="small muted">Geomagnetic storms run from G1 (minor) to G5 (extreme). Severe ones (G4, G5) can upset satellite navigation, radio and, rarely, the power grid. Dads Army warns from G4.</p>';
+    } else if (key === 'pound') {
+      h += '<table class="live-table"><tbody>' +
+        (r.usd ? '<tr><td>£1 in dollars</td><td class="num">$' + esc(r.usd.toFixed(2)) + '</td><td class="num">' + (r.usd_week != null ? esc((r.usd_week > 0 ? '+' : '') + fq(r.usd_week)) + '% in a week' : '') + '</td></tr>' : '') +
+        (r.eur ? '<tr><td>£1 in euros</td><td class="num">€' + esc(r.eur.toFixed(2)) + '</td><td class="num">' + (r.eur_week != null ? esc((r.eur_week > 0 ? '+' : '') + fq(r.eur_week)) + '% in a week' : '') + '</td></tr>' : '') +
+        (r.rate != null ? '<tr><td>Bank Rate</td><td class="num">' + esc(fq(r.rate)) + '%</td><td></td></tr>' : '') + '</tbody></table>' +
+        '<p class="small muted">The Bank of England\'s figures for ' + esc(fmtDate(r.date)) + '. A big fall in the pound makes imported food and fuel dearer over the following months. Dads Army warns at 3% in a week, or 5% in two.</p>';
+    }
+    return h;
+  }
+
+  function sheetLive(s) {
+    var w = W(), rows = w.live_rows || [];
+    var html = sheetHead('The wider picture', 'Live, from public sources', '🌍');
+    if (!rows.length) return html + '<p class="small muted">Nothing yet. These come with warnings, and are checked every 15 minutes or so.</p>';
+    var order = s.key ? rows.filter(function (r) { return r.key === s.key; }).concat(rows.filter(function (r) { return r.key !== s.key; })) : rows;
+    html += order.map(function (r) {
+      var its = w.items.filter(function (x) { return x.source === r.key; });
+      return '<div class="live-block" data-state="' + r.state + '"><h3>' + r.emoji + ' ' + esc(r.name) + '</h3>' +
+        its.map(function (x) {
+          return '<div class="li warn-row sev' + x.severity + '"><span class="li-ico">' + (WARN_ICON[x.kind] || '⚠️') + '</span>' +
+            '<button class="li-main" data-act="warn-open" data-i="' + w.items.indexOf(x) + '"><span class="li-title wrap">' + esc(x.title) + '</span></button></div>';
+        }).join('') +
+        liveDetail(r.key, w.live[r.key] || {}) +
+        '<p class="credit small muted">' + esc(r.credit) + (r.checked_at ? ' · checked ' + esc(ago(r.checked_at)) : '') + '</p></div>';
+    }).join('');
+    return html + '<button class="btn block" data-act="warn-set">Choose what to show</button>';
+  }
+
   function warnHqCard() {
     var w = W();
     var html = '<section class="card"><div class="card-head"><h2>Warnings</h2>' + (w.on ? pill('good', 'On') : pill('plain', 'Off')) + '</div>';
@@ -1108,6 +1441,36 @@
         'Don\'t go to look, and keep away from the smoke.',
         'Close windows and doors to keep smoke out.',
         'If it\'s heading your way, get ready to leave: grab bag, medicines, pets, and know where you\'ll meet.'] };
+    }
+    if (w.kind === 'power') {
+      return { plan: ['power_off'], tips: [
+        'Power off? Call 105, free from any phone, to report it or get updates.',
+        'Charge phones and power banks while you can, and find the torches.',
+        'Keep the fridge and freezer shut: food stays cold for hours.'] };
+    }
+    if (w.kind === 'river') {
+      return { plan: ['meet_near', 'power_off', 'gas_off', 'water_off'], tips: [
+        'Check the flood warnings for where you live, and sign up for free ones at gov.uk/sign-up-for-flood-warnings.',
+        'Keep documents and medicines somewhere high.',
+        'Never walk or drive through flood water.'] };
+    }
+    if (w.kind === 'grid') {
+      return { plan: [], tips: [
+        'Nothing to do but be ready: charge phones and power banks, and know where the torches are.',
+        'If planned rota cuts are announced, your network\'s website will show when your area is off.'] };
+    }
+    if (w.kind === 'air') {
+      return { plan: [], tips: [
+        'If you have a heart or lung condition, do less outdoors, and keep reliever inhalers handy.',
+        'Keep windows shut on busy roads.'] };
+    }
+    if (w.kind === 'space') {
+      return { plan: [], tips: [
+        'Charge power banks and torches, and keep a battery or wind-up radio handy.',
+        'Satellite navigation may be unreliable for a while: have a paper map.'] };
+    }
+    if (w.kind === 'gas' || w.kind === 'money') {
+      return { plan: [], tips: ['Nothing to do today. It\'s a reason to keep the stores and the warm kit topped up.'] };
     }
     if (w.kind === 'disaster') {
       return { plan: [], tips: [
@@ -1183,7 +1546,9 @@
       '<p class="small muted">Dads Army downloads the public warning feeds (the same files for everyone) and works out here which are near you. ' +
       'Nothing about you is sent. If the internet goes down, everything else carries on and the last warnings stay on show.</p>' +
       '<h3>Sources</h3>' + w.source_list.map(function (s) {
-        return '<label class="opt"><input type="checkbox" name="src_' + s[0] + '"' + (c.sources[s[0]] ? ' checked' : '') + '><span>' + esc(s[1]) + '</span></label>';
+        return (s[0] === LIVE_KEYS[0] ? '<h3>Live information</h3><p class="small muted">The wider picture: rivers and power cuts near home, the electricity grid, ' +
+          'gas storage, air quality, space weather and the pound. Each is a public feed for the whole country, so nothing is sent about where you are.</p>' : '') +
+          '<label class="opt"><input type="checkbox" name="src_' + s[0] + '"' + (c.sources[s[0]] ? ' checked' : '') + '><span>' + esc(s[1]) + '</span></label>';
       }).join('') +
       '<h3>Where you are</h3>' +
       '<label class="field"><span>Met Office region</span><select name="region">' +
@@ -1205,8 +1570,10 @@
       (w.fire_ignored ? '<p class="small muted">Ignoring ' + w.fire_ignored + ' fire spot' + (w.fire_ignored === 1 ? '' : 's') +
         ' you\'ve marked as not a wildfire. <button type="button" class="link" data-act="fire-unignore">Show them again</button></p>' : '') +
       (status ? '<h3>Last check</h3>' + status : '') +
-      '<p class="small muted" style="margin-top:12px">Sources: Met Office (weather warnings), Environment Agency (flood warnings, under the Open Government Licence), ' +
-      'GOV.UK Emergency Alerts, GDACS, NASA FIRMS (fire detections), UK Health Security Agency and the World Health Organization.</p>' +
+      '<p class="small muted" style="margin-top:12px">Sources: Met Office (weather warnings), Environment Agency (flood warnings and river levels, under the Open Government Licence), ' +
+      'GOV.UK Emergency Alerts, GDACS, NASA FIRMS (fire detections), UK Health Security Agency, the World Health Organization, ' +
+      'UK Power Networks, National Grid, SSEN and Northern Powergrid (power cuts), NESO and Elexon (grid notices), National Gas (gas storage), ' +
+      'Defra UK-AIR (air quality), NOAA (space weather) and the Bank of England (the pound and Bank Rate).</p>' +
       '<div class="sheet-actions"><button class="btn primary block" type="submit">Save and check now</button></div></form>';
   }
 
@@ -1220,9 +1587,12 @@
     4: ['A red weather warning', 'A flood warning', 'A power cut over 12 hours, or with the backup battery under 20%',
       'The coldest room under 9°C, or the warmest 33°C or more', 'PM2.5 air pollution of 75 µg/m³ or more'],
     3: ['An amber weather warning', 'A possible fire within 3 km', 'A power cut', 'A water leak',
+      'A river near you higher than it\'s been for years',
       'The coldest room under 12°C, or the warmest 30°C or more', '−10°C or colder, or 35°C or hotter, outside',
       'PM2.5 of 55 µg/m³ or more'],
     2: ['A yellow weather warning', 'A flood alert', 'A disaster near the UK', 'A possible fire nearby',
+      'A power cut within 2 km', 'A river near you above its normal range', 'High air pollution', 'A severe solar storm',
+      'A warning of planned rota power cuts',
       'The coldest room under 16°C, or the warmest 27°C or more', '−5°C or colder, or 30°C or hotter, outside',
       'Humidity of 80% or more indoors', 'The internet down', 'PM2.5 of 35 µg/m³ or more',
       'Food or water that wouldn\'t last 3 days', 'An area of resilience missing its essentials'],
@@ -1485,9 +1855,9 @@
   function dashNote() {
     var ha = S.server.ha;
     if (!ha || !ha.dash_outdated) return '';
-    try { if (localStorage.getItem('da-dash-note') === 'layout5') return ''; } catch (e) { /* show it */ }
-    return '<div class="card tip-card"><p><b>New for the Home front dashboard:</b> a map of places to go near home, such as high ground, ' +
-      'leisure centres and your own places, and where to go for each kind of emergency. Resilience across ten areas too, if you haven\'t updated since. ' +
+    try { if (localStorage.getItem('da-dash-note') === 'layout6') return ''; } catch (e) { /* show it */ }
+    return '<div class="card tip-card"><p><b>New for the Home front dashboard:</b> the wider picture: rivers and power cuts near home, ' +
+      'the electricity grid, gas storage, air quality, space weather and the pound. Also the map of places to go, if you haven\'t updated since. ' +
       'Update the dashboard to get them.</p>' +
       '<div class="btn-row"><button class="btn small" data-act="ha-dash" data-again="1">Update the dashboard</button>' +
       '<button class="btn small" data-act="dash-note-hide">Not now</button></div></div>';
@@ -1643,6 +2013,21 @@
       stepperHtml(key, value, label, step, true) + '</div>';
   }
 
+  // Earlier warnings for some categories: medicines you'd want to replace well before they run out of date, say.
+  var WARN_CHOICES = [14, 30, 60, 90, 180];
+  function warnByCat(st) {
+    var by = st.warn_by_cat || {}, n = Object.keys(by).length;
+    return '<details class="warncat"' + (n ? ' open' : '') + '><summary>Warn earlier (or later) for some categories' + (n ? ' · ' + n + ' set' : '') + '</summary>' +
+      '<p class="small muted">For example, 90 days for medicines, so there\'s time to get a new prescription.</p>' +
+      CATS.map(function (c) {
+        var v = by[c.id] || 0;
+        return '<label class="set-row"><span>' + c.icon + ' ' + esc(c.label) + '</span><select data-warncat="' + c.id + '" aria-label="Expiry warning for ' + esc(c.label) + '">' +
+          '<option value="0"' + (v ? '' : ' selected') + '>As above (' + st.warn_days + ' days)</option>' +
+          WARN_CHOICES.map(function (d) { return '<option value="' + d + '"' + (v === d ? ' selected' : '') + '>' + d + ' days</option>'; }).join('') +
+          (v && WARN_CHOICES.indexOf(v) < 0 ? '<option value="' + v + '" selected>' + v + ' days</option>' : '') + '</select></label>';
+      }).join('') + '</details>';
+  }
+
   function renderHQ(el) {
     var st = S.settings, r = readiness(), target = st.target_days;
     var theme = document.documentElement.dataset.theme || 'auto';
@@ -1652,8 +2037,17 @@
       setRow('kcal_adult', 'Calories per adult', 'kcal a day', st.kcal_adult, 100) +
       setRow('kcal_child', 'Calories per child', 'kcal a day', st.kcal_child, 100) +
       setRow('water_per_person', 'Water per person', 'litres a day (drinking & cooking)', st.water_per_person, 0.5) +
-      '<div class="needs">Your household needs <b>' + nf0.format(r.kcalDay) + ' kcal</b> and <b>' + fq(r.waterDay) + ' L of water</b> a day. ' +
-      'For ' + target + ' days that\'s <b>' + nf0.format(r.kcalDay * target) + ' kcal</b> and <b>' + nf0.format(r.waterDay * target) + ' L</b>.</div></section>';
+      '<h3 class="plan-h">Pets</h3>' +
+      setRow('dogs', 'Dogs', '', st.dogs, 1) +
+      (st.dogs ? setRow('water_per_dog', 'Water per dog', 'litres a day: about 50 ml per kg', st.water_per_dog, 0.25) : '') +
+      setRow('cats', 'Cats', '', st.cats, 1) +
+      (st.cats ? setRow('water_per_cat', 'Water per cat', 'litres a day', st.water_per_cat, 0.05) : '') +
+      setRow('other_pets', 'Other pets', '', st.other_pets, 1) +
+      (st.other_pets ? setRow('water_per_other_pet', 'Water per other pet', 'litres a day', st.water_per_other_pet, 0.05) : '') +
+      '<div class="needs">Your household needs <b>' + nf0.format(r.kcalDay) + ' kcal</b> and <b>' + fq(Math.round(r.waterDay * 10) / 10) + ' L of water</b> a day' +
+      (r.petWater > 0 ? ', including ' + fq(Math.round(r.petWater * 100) / 100) + ' L for the pets' : '') + '. ' +
+      'For ' + target + ' days that\'s <b>' + nf0.format(r.kcalDay * target) + ' kcal</b> and <b>' + nf0.format(r.waterDay * target) + ' L</b>.' +
+      (petsCount(st) ? ' Their food is counted from the pet food\'s <b>Used a day</b>.' : '') + '</div></section>';
 
     html += '<section class="card"><div class="card-head"><h2>Readiness target</h2></div>' +
       '<p class="small muted">How many days should your stores last?</p><div class="chips">' +
@@ -1665,7 +2059,7 @@
       '<p class="small muted">Flag stock this many days before it expires.</p><div class="chips">' +
       [14, 30, 60, 90].map(function (d) {
         return '<button class="chip" data-act="set" data-key="warn_days" data-val="' + d + '" aria-pressed="' + (st.warn_days === d) + '">' + d + ' days</button>';
-      }).join('') + '</div></section>';
+      }).join('') + '</div>' + warnByCat(st) + '</section>';
 
     html += '<section class="card"><div class="card-head"><h2>Hard copy &amp; backups</h2></div>' +
       '<p class="small muted">If the power goes, so does the Pi. Keep a printed copy with the stores, and a backup somewhere other than the Pi.</p>' +
@@ -1679,7 +2073,8 @@
       (S.server.last_backup ? ' (last one ' + esc(ago(S.server.last_backup)) + ')' : '') + '.</p></section>';
 
     html += '<section class="card"><div class="card-head"><h2>Starter list</h2></div>' +
-      '<p class="small muted">Adds about 95 suggested essentials at zero stock, with targets sized for your household and ' + target + '-day goal. ' +
+      '<p class="small muted">Adds about 95 suggested essentials at zero stock (and pet food, if you have pets), with targets sized for your household and ' + target + '-day goal. ' +
+      'When the household or the goal changes, those targets change with it, unless you\'ve set one yourself. ' +
       'Anything you already have is skipped. To clear out what you don\'t need, use <b>Select to delete</b> in Stores.</p>' +
       '<button class="btn block" data-act="seed">Load starter list</button></section>';
 
@@ -1757,7 +2152,12 @@
       var body = settingsQueue;
       settingsQueue = {};
       run(function () {
-        return api('PUT', 'api/settings', body).then(refresh).then(function () { toast('Saved'); });
+        return api('PUT', 'api/settings', body).then(function (res) {
+          return refresh().then(function () {
+            toast(res.rescaled ? 'Saved. Targets for ' + res.rescaled + ' starter-list item' + (res.rescaled === 1 ? '' : 's') + ' changed to suit' : 'Saved',
+              res.rescaled ? { ms: 4500 } : {});
+          });
+        });
       });
     }, 450);
   }
@@ -1897,7 +2297,7 @@
       item: sheetItem, edit: sheetEdit, stock: sheetStock, use: sheetUse, batch: sheetBatch, text: sheetText, halists: sheetHaLists,
       check: sheetCheck, plan: sheetPlan, warning: sheetWarning, warnset: sheetWarnSet, help: sheetHelp, dashwiz: sheetDashWiz,
       level: sheetLevel, levelhelp: sheetLevelHelp, homesensors: sheetHomeSensors, area: sheetArea, resall: sheetResAll,
-      place: sheetPlace
+      place: sheetPlace, live: sheetLive
     }[s.type](s);
     if (html === null) {   // the item was deleted elsewhere
       closeSheet();
@@ -1933,15 +2333,17 @@
     var i = info(it), c = cat(it.category), r = readiness();
     var unitWord = isMoney(it.unit) ? '' : plural(it.unit, i.total);
     var stats = [stat(isMoney(it.unit) ? it.unit + fq(i.total) : fq(i.total), (unitWord ? unitWord + ' ' : '') + 'in stock')];
-    if (it.target_qty > 0) stats.push(stat(fq(it.target_qty), i.low ? 'target · short ' + fq(i.short) : 'target · met ✓'));
+    if (it.target_qty > 0) stats.push(stat(fq(it.target_qty), (i.low ? 'target · short ' + fq(i.short) : 'target · met ✓') +
+      (i.old > 0 ? ' · ' + fq(i.old) + ' out of date' : '') + (it.auto_target ? ' · follows the household' : '')));
     if (it.category === 'food' && it.kcal_per_unit > 0 && r.kcalDay > 0) stats.push(stat(fmtDays(i.total * it.kcal_per_unit / r.kcalDay), 'days of food'));
     if (it.category === 'water' && it.litres_per_unit > 0) {
       stats.push(stat(fq(Math.round(i.total * it.litres_per_unit * 10) / 10) + ' L', r.waterDay > 0 ? fmtDays(i.total * it.litres_per_unit / r.waterDay) + ' days of water' : 'of water'));
     }
     if (it.per_day > 0) stats.push(stat(fmtDays(daysLeft(it)), 'days at ' + fq(it.per_day) + ' a day'));
     if (it.price > 0) stats.push(stat(money(i.total * it.price), 'worth, at ' + money(it.price) + ' each'));
+    var use = (S.usage || {})[String(it.id)];
     var batches = it.batches.map(function (b) {
-      var es = expState(b.expiry);
+      var es = expState(b.expiry, it.category);
       var exp = b.expiry
         ? '<span class="badge ' + (es === 'ok' ? 'ok' : es) + '">' + esc(expiryWords(b.expiry)) + '</span>' + esc(fmtDate(b.expiry))
         : '<span class="badge plain">No expiry</span>';
@@ -1954,7 +2356,8 @@
     }).join('');
     return sheetHead(it.name, c.label + (it.unit ? ' · per ' + it.unit : ''), c.icon) +
       '<div class="stats">' + stats.join('') + '</div>' +
-      '<div class="btn-row"><button class="btn" data-act="use-sheet" data-id="' + it.id + '"' + (i.out ? ' disabled' : '') + '>' + ICON.minus + ' Use</button>' +
+      (use ? '<p class="usage">📈 You use ' + esc(use.text) + '. <span class="muted">From ' + use.uses + ' uses since ' + esc(fmtDate(use.since)) + '.</span></p>' : '') +
+      '<div class="btn-row"><button class="btn" data-act="use-sheet" data-id="' + it.id + '"' + (i.none ? ' disabled' : '') + '>' + ICON.minus + ' Use</button>' +
       '<button class="btn primary" data-act="stock" data-id="' + it.id + '">' + ICON.plus + ' Add stock</button></div>' +
       '<h3>Batches' + (it.batches.length > 1 ? ' <small>oldest is used first</small>' : '') + '</h3>' +
       (batches || '<p class="small muted">None in stock.</p>') +
@@ -2257,7 +2660,12 @@
         t.hidden = true;
         if (!snap) return;
         return run(function () {
-          return api('POST', path, snap).then(refresh).then(function () { toast('Undone'); });
+          return api('POST', path, snap).then(function (res) {
+            return refresh().then(function () {
+              var sk = (res && res.skipped) || [];
+              toast(sk.length ? 'Undone, except ' + nameList(sk, 3) + ': changed since' : 'Undone', sk.length ? { ms: 5000 } : {});
+            });
+          });
         });
       }
       case 'check-new':
@@ -2299,6 +2707,23 @@
       }
       case 'warn-set':
         return openSheet({ type: 'warnset' });
+      case 'trend-metric':
+        HIST.metric = a.dataset.val;
+        try { localStorage.setItem('da-trend-metric', HIST.metric); } catch (e) { /* fine */ }
+        var tb = $('#trends'); if (tb) tb.outerHTML = trendsCard();
+        return;
+      case 'trend-days':
+        HIST.days = +a.dataset.val;
+        try { localStorage.setItem('da-trend-days', String(HIST.days)); } catch (e) { /* fine */ }
+        loadHistory(true);
+        return;
+      case 'sort':
+        F.sort = a.dataset.sort;
+        try { localStorage.setItem('da-sort', F.sort); } catch (e) { /* fine */ }
+        if ($('#fSort')) $('#fSort').value = F.sort;
+        return renderStoreList();
+      case 'live-open':
+        return openSheet({ type: 'live', key: a.dataset.key || '' });
       case 'warn-check':
         return checkWarnings(a);
       case 'help':
@@ -2367,7 +2792,7 @@
         return toast('Suggestions ticked. Check them, then Save.');
       }
       case 'dash-note-hide':
-        try { localStorage.setItem('da-dash-note', 'layout5'); } catch (e) { /* fine */ }
+        try { localStorage.setItem('da-dash-note', 'layout6'); } catch (e) { /* fine */ }
         return render();
       case 'help-go': {
         var dest = a.dataset.view;
@@ -2761,6 +3186,13 @@
       return;
     }
     if (t.dataset.setting) { queueSetting(t.dataset.setting, num(t.value)); return; }
+    if (t.dataset.warncat) {
+      var by = {};
+      Object.keys(S.settings.warn_by_cat || {}).forEach(function (k) { by[k] = S.settings.warn_by_cat[k]; });
+      if (+t.value) by[t.dataset.warncat] = +t.value; else delete by[t.dataset.warncat];
+      queueSetting('warn_by_cat', by);
+      return;
+    }
     if (t.name === 'every_days') { syncEvery(t.closest('.field')); return; }
     if (t.name === 'category' && t.form) { t.form.dataset.cat = t.value; return; }
     if (t.id === 'restoreFile' && t.files && t.files[0]) {
@@ -2772,7 +3204,15 @@
         var n = data && data.items ? data.items.length : 0;
         if (!confirm('Restore ' + n + ' items from "' + file.name + '"?\n\nThis REPLACES everything currently in the stores. The Pi keeps a copy of the current data first, just in case.')) return;
         run(function () {
-          return api('POST', 'api/restore', data).then(refresh).then(function () { toast('Restored ' + n + ' items'); });
+          return api('POST', 'api/restore', data).catch(function (err) {
+            if (err.code !== 'empty_backup') throw err;
+            if (!confirm(err.message + '\n\nRestore it anyway?')) return null;
+            data.confirm_empty = true;
+            return api('POST', 'api/restore', data);
+          }).then(function (res) {
+            if (!res) return;
+            return refresh().then(function () { toast('Restored ' + n + ' items'); });
+          });
         });
       };
       reader.readAsText(file);
@@ -2786,6 +3226,12 @@
   });
 
   window.addEventListener('hashchange', function () { setView(location.hash.slice(1)); });
+
+  // Charts: point at one (or touch it) to see the day's values.
+  document.addEventListener('pointermove', chartHover);
+  document.addEventListener('pointerdown', chartHover);
+  // Turning a tablet round, or resizing the window: the Stores switch between the table and the list.
+  if (WIDE.addEventListener) WIDE.addEventListener('change', function () { if (S && view === 'stores') renderStoreList(); });
 
   function poll() {
     if (document.hidden || stack.length) return;

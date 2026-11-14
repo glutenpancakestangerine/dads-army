@@ -18,10 +18,10 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 | `sensor.dads_army_food_days` | Days of food | |
 | `sensor.dads_army_water_days` | Days of water | |
 | `sensor.dads_army_kit_stocked` | Kit and supplies against their targets, in % | |
-| `sensor.dads_army_out_of_stock` | Items with a target but none in stock | `items` (each has `name`, `get`, `unit` and `text`), `total` |
-| `sensor.dads_army_low_stock` | Items with some stock, but below target | `items`, `total`, `below_target_total` |
+| `sensor.dads_army_out_of_stock` | Items with a target but none in stock that's still in date | `items` (each has `name`, `get`, `unit` and `text`), `total` |
+| `sensor.dads_army_low_stock` | Items with some stock, but below target. Out-of-date stock doesn't count towards a target, so it shows here as needing replacing. | `items` (each also has `out_of_date`), `total`, `below_target_total` |
 | `sensor.dads_army_expired` | Items with stock past its best-before date | `items` (each has `name`, `qty`, `expiry`, `days`, `location` and `text`), `total`, `newly_expired` (went out of date overnight) |
-| `sensor.dads_army_expiring_soon` | Items reaching their best-before date within your warning window (HQ) | `items`, `total`, `warn_days`, `expires_today` (on their last day) |
+| `sensor.dads_army_expiring_soon` | Items reaching their best-before date within your warning window (HQ), which can be earlier for some categories, such as medicines | `items`, `total`, `warn_days`, `expires_today` (on their last day) |
 | `sensor.dads_army_next_expiry` | Date of the next thing to expire | `name`, `qty`, `location`, `days` |
 | `sensor.dads_army_supply_run` | Number of things on the shopping list | `items`, `extras`, `cost` (from the prices you've set, in £) |
 | `sensor.dads_army_supplies` | Days until the first thing with a daily use runs out (such as tablets or toilet roll). Unknown if nothing has a daily use set. | `items` (each has `name`, `days`, `have`, `per_day` and `text`), `runs_out_first`, `target_days` |
@@ -30,6 +30,7 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 | `sensor.dads_army_warnings` | Official warnings in force for where you live (see **Warnings** below). 0 while warnings are switched off. | `items` (each has `title`, `level`, `severity` 1–3, `source`, `area`, `when`, `url` and `text`), `highest` (yellow, amber or red), `max_severity`, `enabled`, `checked_at`, `health_news` |
 | `sensor.dads_army_alert_level` | The household alert level: LOW, MODERATE, SUBSTANTIAL, SEVERE or CRITICAL (see below) | `level` (1–5), `meaning`, `reasons`, `guidance` (each with `label`, `source` and `text`), `scale`, `escalated`, `escalated_why`, `notes` |
 | `sensor.dads_army_resilience` | How resilient the household is, in %: the average of ten areas, from water and power to communications and safety (see **Resilience** below) | `areas` (each with `name`, `pct`, `dot`, `done`, `total`, `essentials_missing` and `next`), `next_steps`, `measures` (every recommendation, by area), `done`, `total` |
+| `sensor.dads_army_live` | The wider picture: how many of the live feeds have something worth watching (see **The wider picture** below) | `rows` (each with `name`, `emoji`, `text`, `state` good, warn or bad, and `dot`), `enabled`, `checked_at` |
 | `sensor.dads_army_places` | How many places are on the map (see **Places to go** below) | `located`, `active` (emergencies happening now), `hazards` (each with `what`, `emoji`, `active`, `advice` and `places`), `help` |
 | `geo_location.dads_army_*` | Home and each place to go, for Home Assistant's map card. The state is the distance from home in km. | `latitude`, `longitude`, `source` (`dads_army`, or `dads_army_far` for places over 20 km away), `what`, `direction`, `for` |
 | `binary_sensor.dads_army_attention` | **On** when something needs doing now: stock past its best-before date, a check that's overdue, or a serious warning (amber or worse). Things you haven't bought yet don't count: they're on the supply run. | `reasons` |
@@ -55,6 +56,7 @@ A **Home front** dashboard appears in the Home Assistant sidebar and in the Comp
   - The **i** next to the heading opens **What the levels mean**.
   - Home Assistant has no pop-ups of its own, so these open as pages with a back arrow.
 - **Warnings** in force for where you live
+- **The wider picture:** rivers and power cuts near home, the electricity grid, gas storage, air quality, space weather and the pound, one line each with a green, amber or red dot
 - **Today's checklist:** the routine checks that are due, ready to tick off (see below)
 - **Resilience:** how ready you are in each of the ten areas, two to a row, with the next things to do. **All recommendations** (or the **Resilience** badge) opens a page with every recommendation, area by area, and what's done.
 - **Stores:** expired, expiring soon, out of stock, running low, kit stocked, what the stores are worth, and what to use first
@@ -369,6 +371,7 @@ How it works:
 - Tap a warning for the full message, a link to the official page, what to do, and the parts of your emergency plan that matter, such as where to meet and how to turn things off.
 - If the internet goes down, everything else carries on, and the last warnings found stay on show with when they were checked.
 - Keep **Emergency Alerts** switched on in your phone's settings too. They reach the phone directly, much faster than any feed.
+- Every request carries only Dads Army's name: no cookies, no referrer and nothing about you.
 
 Flood warnings outside England come from SEPA (Scotland), Natural Resources Wales and NI Direct, which Dads Army doesn't read yet.
 
@@ -378,6 +381,42 @@ Flood warnings outside England come from SEPA (Scotland), Natural Resources Wale
 - Satellites only pass over a few times a day, so a fire can be a few hours old before it shows.
 - If you can see a fire that looks out of control, call 999.
 
+## The wider picture
+
+Switched on with the warnings, and listed under **Live information** in the warnings settings, where each can be switched off. On the Sitrep, the Home front dashboard and `sensor.dads_army_live`. Tap a line for the details.
+
+| Feed | What you get | Warns when |
+|---|---|---|
+| River levels (Environment Agency, England) | The river gauges within 10 km, against their usual range, and whether each is rising or falling | A river is above its usual range, or above its highest in recent years |
+| Power cuts (UK Power Networks, National Grid, SSEN, Northern Powergrid) | Power cuts and planned work within 10 km | A power cut within 2 km, or planned work there |
+| The electricity grid (NESO, through Elexon) | Electricity margin and capacity market notices | A notice is in force; a warning of planned rota power cuts counts as serious |
+| Gas storage (National Gas) | How full Great Britain's gas storage is, against a year ago | It's emptying much faster than a year ago over two weeks, or it's nearly empty in winter |
+| Air quality (Defra UK-AIR) | The Daily Air Quality Index at the nearest monitoring site, and the forecast | It's high (7 or more) now or in the next two days |
+| Space weather (NOAA) | The geomagnetic storm scale, now and for the next three days | A severe storm (G4 or G5) |
+| The pound (Bank of England) | The pound against the dollar and the euro, and Bank Rate | The pound falls 3% in a week, or 5% in two weeks. A Bank Rate change shows as news. |
+
+- Like the warnings, each feed is the whole country (or a whole network) in one download, and Dads Army picks out what's near home itself. Nothing about you is sent.
+- Slow-changing feeds are fetched less often: gas storage every three hours, the pound every six.
+- A power cut within 2 km, a high river, high air pollution, a severe solar storm or a warning of rota power cuts raises the household alert level to at least MODERATE. A very high river raises it to SUBSTANTIAL. Gas storage and the pound don't change the level.
+- Not covered yet: river levels in Scotland and Wales (SEPA and Natural Resources Wales), and power cuts from SP Energy Networks and Electricity North West, which need an account. There's no official free source for the FTSE 100, so it isn't included.
+
+Sources: Environment Agency flood and river level data from the real-time data API (Beta), and Defra's UK-AIR, under the Open Government Licence; power cut data from UK Power Networks, National Grid Electricity Distribution, SSEN and Northern Powergrid under their open data licences; system warnings from Elexon's BMRS; National Gas's data portal; NOAA's Space Weather Prediction Center; and the Bank of England's database, under the Open Government Licence.
+
+## Trends
+
+The Sitrep's **Trends** card charts how many days the food and water would last, and the resilience score, day by day, over 30 days, 90 days, a year or everything. Point at the chart (or touch it) to see a day's figures, or open **Show as a table**.
+
+Dads Army records one line a day from 1.11.0, and keeps five years. When it first runs as a Home Assistant app, it fills in the days Home Assistant still remembers for the Dads Army sensors (usually the last ten).
+
+## On a tablet or a wider screen
+
+On a screen 900 pixels wide or more, such as a landscape tablet on the wall:
+
+- the tabs move to a rail down the left
+- the Sitrep, Plan, Supply run and HQ cards flow into two or three columns
+- **Stores** becomes a table: item, in stock, target, best before, where, how long it lasts and status. Tap a heading to sort by it.
+- details open in the middle of the screen
+
 ## Routine checks, daily use and the emergency plan
 
 The **Plan** tab in Dads Army holds two things:
@@ -386,6 +425,14 @@ The **Plan** tab in Dads Army holds two things:
 - **Emergency plan:** who to call, where to meet, how to turn off the water, gas and electricity, medical needs, pets and where the documents are. It's stored with the stores, so it works with the internet down, and it prints on a page for the grab bag. **Add UK emergency numbers** fills in 999, 111, 105 (power cuts), the gas emergency line, Floodline and 101.
 
 When you edit an item, **Used a day** says how many your household gets through each day (tablets, nappies, toilet roll, gas canisters). Dads Army then shows how long each one lasts, and the Sitrep's **Daily supplies** bar shows the first to run out. **Price each** adds up what the stores are worth and what the supply run will cost.
+
+Dads Army also notices how fast you actually use things. Once you've tapped **−** on something twice or more, its page says something like "You use about 2 tins a week, lasts 6 weeks", from the last three months.
+
+**Pets.** In **HQ → Household**, say how many dogs, cats and other pets you have. Their drinking water is added to the household's (about a litre a day for a medium dog and a quarter for a cat; you can change these). Set **Used a day** on their food, and the Sitrep shows how long it lasts. The starter list then adds dog or cat food, pet medicines and a carrier.
+
+**Starter list targets follow the household.** Targets from the starter list are sized for your household and readiness target. Change either, and those targets change with them, unless you've set one yourself.
+
+**Expiry warnings by category.** In **HQ → Expiry warning**, you can warn earlier (or later) for some categories: 90 days for medicines, say, so there's time to get a new prescription.
 
 ## Automation ideas
 
@@ -399,7 +446,11 @@ When you edit an item, **Used a day** says how many your household gets through 
 
 Your data is kept in the app's own storage. It survives restarts and updates, and it's included in your Home Assistant backups. On top of that:
 
-- Dads Army saves a copy of its database every day and keeps the last 14.
+- Dads Army saves a copy of its database every day and keeps the last 14. Each copy is checked before it's kept, and if one isn't sound, the earlier ones stay.
+- Out-of-date stock doesn't count towards a target, so out-of-date tins show on the supply run as needing replacing.
+- **Restore from a backup** checks the whole file before changing anything, saves a copy of what you have first, and asks before restoring a backup with nothing in it.
+- An undo never overwrites a newer change: if someone has used or changed the same thing on another phone since, the undo says so and leaves it.
+- The spreadsheet export can't be made to run formulas: a cell starting with = + − or @ is saved as plain text.
 - HQ → **Download backup** saves a copy to your phone.
 - HQ → **Print full inventory** gives you a paper copy to keep with the stores, and **Print emergency plan & checks** gives you the plan.
 

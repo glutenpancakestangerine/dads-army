@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.11.0
+
+**Fixes**
+
+- **Out-of-date stock no longer counts towards targets.** Out-of-date tins show on the supply run as needing replacing, and an item with only out-of-date stock counts as out of stock.
+- **The spreadsheet export can't be made to run formulas.** A cell starting with = + − or @ is saved as plain text.
+- **Backups:**
+  - each daily copy is checked before it's kept, and copies never overwrite each other
+  - restoring a backup with nothing in it asks first
+  - a restore stops if it can't save a copy of what you have first
+- **Undo won't overwrite a newer change** to the same item or check, made on another phone or by Home Assistant. It says what it left alone.
+- **"Ran out" alerts aren't lost** while Home Assistant can't be reached. They're sent when it's back, unless the thing has been restocked by then.
+- **Stricter checks on what's typed in.** Dates, numbers and ids are checked strictly, and an out-of-range number is refused rather than quietly changed.
+
+**New**
+
+- **Pets.** Say how many dogs, cats and other pets you have in HQ. Their water counts towards the household's. The Sitrep shows how long their food lasts. The starter list adds pet food, medicines and a carrier.
+- **Starter list targets follow the household.** Change the household or the readiness target, and targets from the starter list change to suit, unless you've set them yourself.
+- **Expiry warnings by category:** warn earlier for medicines (90 days, say) than for tins.
+- **How fast you use things:** "You use about 2 tins a week, lasts 6 weeks", from the last three months.
+- **The wider picture.** These come with warnings, and each can be switched off. Like the warnings, each is a public feed for the whole country, so nothing about you is sent.
+  - **River levels** near you, against their normal range, rising or falling (England).
+  - **Power cuts** within 10 km, from UK Power Networks, National Grid, SSEN and Northern Powergrid.
+  - **Electricity grid notices** from NESO.
+  - **Gas storage**, against a year ago.
+  - **Air quality** now and forecast.
+  - **Space weather.**
+  - **The pound and Bank Rate.**
+  - Warnings when something's up, including two-week trends such as "gas storage is emptying faster than this time last year".
+  - A nearby power cut, a high river, high air pollution or a severe solar storm raises the household alert level.
+  - On the Sitrep, on the Home front dashboard (**Update the dashboard** to add it), and in `sensor.dads_army_live`.
+- **Trends:** charts of how many days the food and water would last, and of resilience, day by day. Dads Army now keeps a line a day, and fills in the first days from what Home Assistant remembers.
+- **Wall tablets and wider screens:** the tabs move to a rail down the side, the cards flow into two or three columns, details open in the middle, and **Stores** becomes a table you can sort.
+- **Tests:** a `tests` folder with about 100 tests of the server, backups, undo, Home Assistant sync and the feeds.
+
 ## 1.10.0
 
 - **Places to go.** If staying at home isn't safe, where could you go? Dads Army suggests places near home for each kind of emergency: flooding, storms, a wildfire, an earthquake, civil unrest, a heatwave, cold or a long power cut, having to leave home, and a medical emergency. Each comes with a line of advice.

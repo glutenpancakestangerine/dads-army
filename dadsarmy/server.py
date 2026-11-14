@@ -48,9 +48,9 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -72,6 +72,16 @@ DEFAULT_SETTINGS = {
     "water_per_person": 3,
     "target_days": 30,
     "warn_days": 30,
+    # Pets (1.11.0): their water counts towards the household's, and pet food has its own days.
+    # Typical drinking water: about 50 ml per kg a day, so roughly a litre for a medium dog, a quarter for a cat.
+    "dogs": 0,
+    "cats": 0,
+    "other_pets": 0,
+    "water_per_dog": 1.0,
+    "water_per_cat": 0.25,
+    "water_per_other_pet": 0.2,
+    # Earlier warning for some categories, e.g. {"medical": 90}. Others use warn_days.
+    "warn_by_cat": {},
 }
 # (min, max, integer?)
 SETTING_RULES = {
@@ -82,7 +92,49 @@ SETTING_RULES = {
     "water_per_person": (0.5, 20, False),
     "target_days": (1, 3650, True),
     "warn_days": (1, 365, True),
+    "dogs": (0, 20, True),
+    "cats": (0, 20, True),
+    "other_pets": (0, 50, True),
+    "water_per_dog": (0, 10, False),
+    "water_per_cat": (0, 5, False),
+    "water_per_other_pet": (0, 5, False),
 }
+SETTING_LABELS = {"adults": "Adults", "children": "Children", "kcal_adult": "Calories per adult",
+                  "kcal_child": "Calories per child", "water_per_person": "Water per person",
+                  "target_days": "The readiness target", "warn_days": "The expiry warning", "dogs": "Dogs", "cats": "Cats",
+                  "other_pets": "Other pets", "water_per_dog": "Water per dog", "water_per_cat": "Water per cat",
+                  "water_per_other_pet": "Water per pet"}
+# Settings that change what the starter list's targets should be.
+SCALES_TARGETS = ("adults", "children", "kcal_adult", "kcal_child", "water_per_person", "target_days",
+                  "dogs", "cats", "other_pets", "water_per_dog", "water_per_cat", "water_per_other_pet")
+
+
+def clean_warn_by_cat(value):
+    if not isinstance(value, dict):
+        raise ApiError(400, "Expiry warnings by category should be a list of categories and days")
+    out = {}
+    for k, v in value.items():
+        if k not in CATEGORIES:
+            raise ApiError(400, "%s isn't a category" % clean_text(k, 30))
+        if v in (None, "", 0):
+            continue
+        out[k] = int(round(clean_num(v, None, 1, 365, "Days before it expires")))
+    return out
+
+
+def warn_for(cat, st):
+    """How many days before its best-before date a thing in this category counts as expiring soon."""
+    by = st.get("warn_by_cat") or {}
+    return by.get(cat) or st["warn_days"]
+
+
+def pets_water(st):
+    return (st["dogs"] * st["water_per_dog"] + st["cats"] * st["water_per_cat"]
+            + st["other_pets"] * st["water_per_other_pet"])
+
+
+def pets_count(st):
+    return st["dogs"] + st["cats"] + st["other_pets"]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -142,9 +194,36 @@ CREATE TABLE IF NOT EXISTS checks (
     notes      TEXT    NOT NULL DEFAULT '',
     created_at TEXT    NOT NULL
 );
+-- What gets used and when, for "about 2 a week, lasts 6 weeks". Use adds a row; its undo takes it off.
+-- No foreign key: an undone delete puts the item back with the same id, and its history with it.
+CREATE TABLE IF NOT EXISTS usage (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL,
+    ts      TEXT    NOT NULL,
+    qty     REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_item ON usage(item_id, ts);
+-- One row a day: how ready the household was, for the trend charts.
+CREATE TABLE IF NOT EXISTS history (
+    day          TEXT PRIMARY KEY,
+    readiness    INTEGER NOT NULL DEFAULT 0,
+    hold_out     REAL    NOT NULL DEFAULT 0,
+    food_days    REAL    NOT NULL DEFAULT 0,
+    water_days   REAL    NOT NULL DEFAULT 0,
+    resilience   INTEGER NOT NULL DEFAULT 0,
+    level        INTEGER NOT NULL DEFAULT 1,
+    items        INTEGER NOT NULL DEFAULT 0,
+    expired      INTEGER NOT NULL DEFAULT 0,
+    below_target INTEGER NOT NULL DEFAULT 0,
+    value        REAL    NOT NULL DEFAULT 0
+);
 """
 # Columns added to items after 1.0, for databases made by older versions.
-ITEM_UPGRADES = [("per_day", "REAL NOT NULL DEFAULT 0"), ("price", "REAL NOT NULL DEFAULT 0")]
+ITEM_UPGRADES = [("per_day", "REAL NOT NULL DEFAULT 0"), ("price", "REAL NOT NULL DEFAULT 0"),
+                 # 1.11.0: a change counter, so an undo can't overwrite a newer change made on another phone;
+                 # and, for things from the starter list, which one (so targets can follow the household).
+                 ("rev", "INTEGER NOT NULL DEFAULT 0"), ("starter", "TEXT NOT NULL DEFAULT ''"),
+                 ("auto_target", "INTEGER NOT NULL DEFAULT 0")]
 ITEM_FIELDS = ("name", "category", "unit", "kcal_per_unit", "litres_per_unit", "target_qty", "per_day", "price",
                "notes")
 
@@ -275,14 +354,27 @@ STARTER = [
 
     ("Grab bag (packed & ready)", "other", "bag", 0, 0, 1,
      "A rucksack ready to go if you have to leave in a hurry."),
+
+    # Only added when there are pets in the household (HQ → Household).
+    ("Dry dog food (2kg bag)", "pets", "bag", 0, 0, ("dogday", 0.15),
+     "About 300 g a day for a medium dog: check the bag for your dog's size."),
+    ("Dry cat food (2kg bag)", "pets", "bag", 0, 0, ("catday", 0.03),
+     "About 60 g a day for a typical cat."),
+    ("Pet medicines & flea treatment", "pets", "pack", 0, 0, ("pets", 1),
+     "Any regular medicines, and a copy of the vaccination record."),
+    ("Pet carrier or spare lead", "pets", "each", 0, 0, ("pets", 1),
+     "In case you have to leave in a hurry. Most rest centres only take pets in a carrier or on a lead."),
 ]
+STARTER_BY_NAME = {s[0]: s for s in STARTER}
+PET_SPECS = ("dogday", "catday", "pets")
 
 
 class ApiError(Exception):
-    def __init__(self, status, message):
+    def __init__(self, status, message, code=None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.code = code   # for the app to act on (e.g. "empty_backup": ask before going ahead)
 
 
 class Raw(object):
@@ -292,6 +384,18 @@ class Raw(object):
         self.data = data
         self.content_type = content_type
         self.filename = filename
+
+
+ROUTES = []
+
+
+def route(method, pattern):
+    rx = re.compile("^" + pattern + "$")
+
+    def deco(fn):
+        ROUTES.append((method, rx, fn))
+        return fn
+    return deco
 
 
 LOCK = threading.RLock()
@@ -337,12 +441,18 @@ def init_db():
             DB.execute("ALTER TABLE items ADD COLUMN %s %s" % (col, decl))
     for key, value in DEFAULT_SETTINGS.items():
         DB.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(value)))
+    with tx() as db:
+        mark_starter_items(db)
 
 
 # --------------------------------------------------------------------------
 # Validation helpers
 # --------------------------------------------------------------------------
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Strict on purpose: plain ASCII digits only (no "١٢", "1_000", "nan", "1e400" or trailing newlines).
+DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+NUM_RE = re.compile(r"-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)")
+ID_RE = re.compile(r"[0-9]{1,15}")
+YEARS = (1900, 2200)   # best-before and done dates outside these are typing mistakes
 
 
 def clean_text(value, maxlen, default=""):
@@ -350,33 +460,57 @@ def clean_text(value, maxlen, default=""):
         return default
     if isinstance(value, bool) or not isinstance(value, (str, int, float)):
         raise ApiError(400, "Invalid text value")
-    return str(value).strip()[:maxlen]
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        raise ApiError(400, "Invalid text value")
+    # Control characters (other than new lines and tabs) have no business in a name or a note.
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str(value)).strip()[:maxlen]
 
 
-def clean_num(value, default=0.0, lo=0.0, hi=1e7, field="Value"):
+def _fmt_lim(x):
+    return fq(x) if abs(x) < 1e6 else "{:,}".format(int(x))
+
+
+def clean_num(value, default=0.0, lo=0.0, hi=1e7, field="Value", ndigits=3):
+    """A number in [lo, hi], from a JSON number or a plain decimal string. Anything else is refused."""
     if value is None or value == "":
         return default
     if isinstance(value, bool):
         raise ApiError(400, "%s must be a number" % field)
+    if isinstance(value, str):
+        s = value.strip()
+        if len(s) > 32 or not NUM_RE.fullmatch(s):
+            raise ApiError(400, "%s must be a number" % field)
+        value = s
+    elif not isinstance(value, (int, float)):
+        raise ApiError(400, "%s must be a number" % field)
     try:
         f = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ApiError(400, "%s must be a number" % field)
     if math.isnan(f) or math.isinf(f):
         raise ApiError(400, "%s must be a number" % field)
-    return min(hi, max(lo, round(f, 3)))
+    f = round(f, ndigits)
+    if f < lo or f > hi:
+        if lo == 0 and f < 0:
+            raise ApiError(400, "%s can't be less than zero" % field)
+        raise ApiError(400, "%s must be between %s and %s" % (field, _fmt_lim(lo), _fmt_lim(hi)))
+    return f
 
 
 def clean_date(value):
     if value in (None, ""):
         return None
-    value = str(value).strip()
-    if not DATE_RE.match(value):
+    if not isinstance(value, str):
+        raise ApiError(400, "Dates must look like 2027-03-31")
+    value = value.strip()
+    if not DATE_RE.fullmatch(value):
         raise ApiError(400, "Dates must look like 2027-03-31")
     try:
-        dt.date(int(value[:4]), int(value[5:7]), int(value[8:10]))
+        d = dt.date(int(value[:4]), int(value[5:7]), int(value[8:10]))
     except ValueError:
         raise ApiError(400, "%s isn't a real date" % value)
+    if not YEARS[0] <= d.year <= YEARS[1]:
+        raise ApiError(400, "Check the year: %s" % value)
     return value
 
 
@@ -460,10 +594,18 @@ def expiry_words(days):
 
 
 def as_int_id(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
+    """A record id: a whole number from 1 up, as a JSON integer or a string of digits. Not 1.5, True or "1e3"."""
+    if isinstance(value, bool):
         raise ApiError(400, "Bad id")
+    if isinstance(value, int):
+        n = value
+    elif isinstance(value, str) and ID_RE.fullmatch(value):
+        n = int(value)
+    else:
+        raise ApiError(400, "Bad id")
+    if n < 1 or n > 2 ** 53:
+        raise ApiError(400, "Bad id")
+    return n
 
 
 # --------------------------------------------------------------------------
@@ -477,12 +619,17 @@ def add_log(action, item="", detail=""):
 
 def get_settings():
     out = dict(DEFAULT_SETTINGS)
+    out["warn_by_cat"] = {}
     for row in DB.execute("SELECT key, value FROM settings"):
         if row["key"] in out:
             try:
                 out[row["key"]] = json.loads(row["value"])
             except ValueError:
                 pass
+    try:
+        out["warn_by_cat"] = clean_warn_by_cat(out["warn_by_cat"])
+    except ApiError:
+        out["warn_by_cat"] = {}
     return out
 
 
@@ -596,7 +743,8 @@ def summary():
     warn = st["warn_days"]
     people = st["adults"] + st["children"]
     kcal_day = st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]
-    water_day = people * st["water_per_person"]
+    pet_water = pets_water(st)
+    water_day = people * st["water_per_person"] + pet_water
     kcal = litres = 0.0
     kit_n, kit_sum = 0, 0.0
     value = cost = 0.0
@@ -639,27 +787,33 @@ def summary():
             supplies.append((lasts, {"id": it["id"], "name": it["name"], "category": cat, "unit": unit,
                                      "have": _num(in_date), "per_day": _num(per_day), "days": _days(lasts),
                                      "text": text}))
+        # Only stock that's in date counts towards the target: out-of-date tins need replacing.
+        old = round(total - in_date, 3)
         if target > 0 and cat not in ("food", "water"):
             kit_n += 1
-            kit_sum += min(1.0, total / target)
-        if target > 0 and total < target:
-            get = round(target - total, 3)
+            kit_sum += min(1.0, in_date / target)
+        if target > 0 and in_date < target:
+            get = round(target - in_date, 3)
             cost += get * price
-            entry = {"id": it["id"], "name": it["name"], "category": cat, "have": _num(total), "target": _num(target),
-                     "unit": unit, "get": _num(get),
-                     "text": "Get %s" % qu(get, unit) + (" · have %s of %s" % (fq(total), fq(target))
-                                                          if total > 0 else "")}
+            text = "Get %s" % qu(get, unit)
+            if in_date > 0:
+                text += " · have %s of %s" % (fq(in_date), fq(target))
+            if old > 0:
+                text += " · %s out of date" % fq(old)
+            entry = {"id": it["id"], "name": it["name"], "category": cat, "have": _num(in_date),
+                     "target": _num(target), "unit": unit, "get": _num(get), "out_of_date": _num(old), "text": text}
             if price > 0:
                 entry["cost"] = round(get * price, 2)
-            (out if total <= 0 else low).append((total / target, entry))
+            (out if in_date <= 0 else low).append((in_date / target, entry))
 
         # Like the app, an item's expiry state comes from its soonest-dated batch.
         if dated:
             d0, b0 = min(dated, key=lambda x: (x[0], x[1]["id"]))
+            soon_days = warn_for(cat, st)
             if d0 < 0:
                 hit, bucket = [b for d, b in dated if d < 0], expired
-            elif d0 <= warn:
-                hit, bucket = [b for d, b in dated if 0 <= d <= warn], soon
+            elif d0 <= soon_days:
+                hit, bucket = [b for d, b in dated if 0 <= d <= soon_days], soon
             else:
                 hit, bucket = None, None
             if hit:
@@ -703,12 +857,20 @@ def summary():
 
     sup = ordered(supplies)
     target_days = st["target_days"]
+    # Pets: their water is in water_days already; their food lasts as long as the pet food with a daily use.
+    pet_food = [e for e in sup if e["category"] == "pets"]
+    pets = {"count": pets_count(st), "dogs": st["dogs"], "cats": st["cats"], "other": st["other_pets"],
+            "water_litres": _num(round(pet_water, 2)),
+            "food_days": pet_food[0]["days"] if pet_food else None,
+            "food_runs_out_first": pet_food[0]["name"] if pet_food else ""}
     out = {
         "version": VERSION,
         "date": today.isoformat(),
         "people": people,
+        "pets": pets,
         "target_days": target_days,
         "warn_days": warn,
+        "warn_by_cat": st["warn_by_cat"],
         # Hold-out against the readiness target; 100 means the target is met.
         "readiness_pct": min(100, int(math.floor(100.0 * hold / target_days))) if target_days > 0 else 0,
         "hold_out_days": _days(hold),
@@ -750,6 +912,177 @@ def summary():
     return out
 
 
+# -- Daily history, for the trend charts ---------------------------------------------
+HISTORY_FIELDS = ("readiness", "hold_out", "food_days", "water_days", "resilience", "level", "items", "expired",
+                  "below_target", "value")
+HISTORY_KEEP_DAYS = 5 * 366
+USAGE_KEEP_DAYS = 400
+HISTORY_EVERY = float(os.environ.get("DADSARMY_HISTORY_EVERY", "1800"))
+
+
+def history_row(s):
+    return {"readiness": s["readiness_pct"], "hold_out": s["hold_out_days"], "food_days": s["food_days"],
+            "water_days": s["water_days"], "resilience": s["resilience"]["pct"], "level": s["situation"]["level"],
+            "items": s["items_total"], "expired": len(s["expired"]), "below_target": len(s["supply_run"]["below_target"]),
+            "value": s["stores_value"]}
+
+
+def record_history(s=None):
+    """Today's row: written through the day, so it ends up as how things stood at the end of it."""
+    s = s or summary()
+    row = history_row(s)
+    with tx() as db:
+        db.execute("INSERT OR REPLACE INTO history(%s) VALUES (%s)" % (
+            ", ".join(("day",) + HISTORY_FIELDS), ", ".join("?" * (len(HISTORY_FIELDS) + 1))),
+            [s["date"]] + [row[k] for k in HISTORY_FIELDS])
+        today = dt.date.fromisoformat(s["date"])
+        db.execute("DELETE FROM history WHERE day < ?", ((today - dt.timedelta(days=HISTORY_KEEP_DAYS)).isoformat(),))
+        db.execute("DELETE FROM usage WHERE ts < ?", ((today - dt.timedelta(days=USAGE_KEEP_DAYS)).isoformat(),))
+    return row
+
+
+def history_loop():
+    time.sleep(5)
+    while True:
+        try:
+            record_history()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(HISTORY_EVERY)
+
+
+BACKFILL = {"sensor.dads_army_food_days": "food_days", "sensor.dads_army_water_days": "water_days",
+            "sensor.dads_army_hold_out": "hold_out", "sensor.dads_army_readiness": "readiness",
+            "sensor.dads_army_resilience": "resilience"}
+
+
+def backfill_history():
+    """Daily history started in 1.11.0, but Home Assistant keeps its own record of the Dads Army sensors
+    (ten days, unless you've changed it). Once, fill in the days it has, so the trend charts aren't empty
+    to begin with. Anything it doesn't know is -1, which the charts leave out."""
+    with LOCK:
+        if setting_raw("history_backfilled", False):
+            return 0
+    start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=HISTORY_KEEP_DAYS)).replace(microsecond=0)
+    status, data = ha_request("GET", "/history/period/%s?filter_entity_id=%s&minimal_response&no_attributes" % (
+        quote(start.isoformat()), ",".join(sorted(BACKFILL))), timeout=60)
+    if status != 200 or not isinstance(data, list):
+        if 400 <= status < 500:   # no history to be had (the recorder's off): don't keep asking
+            with tx() as db:
+                set_setting_raw(db, "history_backfilled", True)
+        return 0   # Home Assistant busy or restarting: try again next time
+    points = {}
+    for series in data:
+        if not isinstance(series, list) or not series or not isinstance(series[0], dict):
+            continue
+        key = BACKFILL.get(series[0].get("entity_id"))
+        if not key:
+            continue
+        for pt in series:
+            v = _f0(pt.get("state")) if isinstance(pt, dict) else None
+            when = parse_when(pt.get("last_changed") or pt.get("last_updated")) if isinstance(pt, dict) else None
+            if v is not None and when:
+                points.setdefault(key, []).append((when.astimezone().date(), v))
+    today = dt.date.today()
+    rows = {}
+    for key, pts in points.items():
+        pts.sort(key=lambda x: x[0])
+        day, i, last = pts[0][0], 0, None
+        while day < today:   # the value at the end of each day, carried forward over days with no change
+            while i < len(pts) and pts[i][0] <= day:
+                last = pts[i][1]
+                i += 1
+            rows.setdefault(day.isoformat(), {})[key] = last
+            day += dt.timedelta(days=1)
+    n = 0
+    with tx() as db:
+        have = set(r[0] for r in db.execute("SELECT day FROM history"))
+        for day in sorted(rows):
+            if day in have:
+                continue
+            row = dict((k, -1) for k in HISTORY_FIELDS)
+            row.update((k, v) for k, v in rows[day].items() if v is not None)
+            db.execute("INSERT INTO history(%s) VALUES (%s)" % (
+                ", ".join(("day",) + HISTORY_FIELDS), ", ".join("?" * (len(HISTORY_FIELDS) + 1))),
+                [day] + [row[k] for k in HISTORY_FIELDS])
+            n += 1
+        set_setting_raw(db, "history_backfilled", True)
+    return n
+
+
+@route("GET", "/api/history")
+def api_history(body, query):
+    """Up to five years of daily rows, oldest first: ?days=90 for the last 90."""
+    days = (query.get("days") or ["365"])[0]
+    days = int(clean_num(days, 365, 1, HISTORY_KEEP_DAYS, "Days"))
+    since = (dt.date.today() - dt.timedelta(days=days - 1)).isoformat()
+    with LOCK:
+        rows = [dict(r) for r in DB.execute("SELECT * FROM history WHERE day >= ? ORDER BY day", (since,))]
+    return {"days": days, "rows": rows}
+
+
+# -- How fast things get used ------------------------------------------------------------
+USAGE_WINDOW = 91   # days of using things that count towards "about 2 a week"
+
+
+def _nice(n):
+    """A friendly 'about' number: 0.3 -> 0.5, 1.7 -> 1.5, 2.4 -> 2.5, 13.6 -> 14."""
+    if n >= 10:
+        return float(_round(n))
+    return max(0.5, _round(n * 2) / 2.0)
+
+
+def rate_words(per_day, unit=""):
+    """0.29 a day -> 'about 2 a week' (with the unit, 'about 2 tins a week')."""
+    week = per_day * 7
+    if week >= 14:
+        n, per = per_day, "day"
+    elif week >= 1:
+        n, per = week, "week"
+    else:
+        n, per = per_day * 30.44, "month"
+        if n < 0.75:
+            return "less than one a month" if not unit else "less than %s a month" % qu(1, unit)
+    n = _nice(n)
+    return "about %s a %s" % (qu(n, unit) if unit else fq(n), per)
+
+
+def usage_rates(items, today=None):
+    """{item id: how fast it goes} from the last three months of using it. It takes two uses or more, and
+    a week at least, so one tin opened yesterday doesn't read as a tin a day."""
+    today = today or dt.date.today()
+    since = (today - dt.timedelta(days=USAGE_WINDOW)).isoformat()
+    with LOCK:
+        rows = DB.execute("SELECT item_id, MIN(ts) AS first, COUNT(*) AS n, SUM(qty) AS qty FROM usage "
+                          "WHERE ts >= ? GROUP BY item_id", (since,)).fetchall()
+    by_id = dict((it["id"], it) for it in items)
+    out = {}
+    for r in rows:
+        it = by_id.get(r["item_id"])
+        if not it or r["n"] < 2:
+            continue
+        try:
+            first = dt.date.fromisoformat(r["first"][:10])
+        except ValueError:
+            continue
+        span_days = max(7, (today - first).days + 1)
+        per_day = r["qty"] / float(span_days)
+        have = sum(b["qty"] for b in it["batches"]
+                   if not b["expiry"] or (_days_until(b["expiry"], today) or 0) >= 0)
+        lasts = have / per_day if per_day > 0 else None
+        words = rate_words(per_day, it["unit"] or "")
+        if lasts is None:
+            tail = ""
+        elif have <= 0:
+            tail = ", none left"
+        else:
+            tail = ", lasts " + lasts_words(lasts).lower()
+        out[it["id"]] = {"per_day": round(per_day, 4), "uses": r["n"], "since": first.isoformat(),
+                         "days": span_days, "lasts_days": _days(lasts) if lasts is not None else None,
+                         "text": words + tail}
+    return out
+
+
 def get_item(db, item_id):
     row = db.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
     if not row:
@@ -765,24 +1098,23 @@ def snapshot(db, item_id):
 
 
 def touch(db, item_id):
-    db.execute("UPDATE items SET updated_at = ? WHERE id = ?", (now_iso(), item_id))
+    db.execute("UPDATE items SET updated_at = ?, rev = rev + 1 WHERE id = ?", (now_iso(), item_id))
+
+
+def item_rev(db, item_id):
+    row = db.execute("SELECT rev FROM items WHERE id = ?", (item_id,)).fetchone()
+    return row["rev"] if row else None
+
+
+def undo_of(db, snap, item_id):
+    """An undo for a change just made: the item as it was, and its change count now (None if it's gone)."""
+    snap["after"] = item_rev(db, item_id)
+    return snap
 
 
 # --------------------------------------------------------------------------
 # API routes
 # --------------------------------------------------------------------------
-ROUTES = []
-
-
-def route(method, pattern):
-    rx = re.compile("^" + pattern + "$")
-
-    def deco(fn):
-        ROUTES.append((method, rx, fn))
-        return fn
-    return deco
-
-
 @route("GET", "/api/health")
 def api_health(body, query):
     return {"ok": True, "version": VERSION}
@@ -795,13 +1127,16 @@ def api_state(body, query):
     with LOCK:
         if home is not None:
             home["config"] = home_cfg()
+        items = all_items()
         return {
             "situation": sm["situation"],
+            "pets": sm["pets"],
+            "usage": dict((str(k), v) for k, v in usage_rates(items).items()),
             "resilience": sm["resilience"],
             "places": sm["places"],
             "place_hazards": [[k, w, e] for k, w, e, _, _ in PLACE_HAZARDS],
             "home": home,
-            "items": all_items(),
+            "items": items,
             "shopping": [dict(r) for r in DB.execute("SELECT * FROM shopping ORDER BY done, id")],
             "checks": all_checks(),
             "check_suggestions": [c[0] for c in CHECK_SUGGESTIONS],
@@ -842,9 +1177,11 @@ def api_item_update(body, query, item_id):
     if not data:
         raise ApiError(400, "Nothing to change")
     with tx() as db:
-        get_item(db, item_id)
+        before = get_item(db, item_id)
+        if "target_qty" in data and before["auto_target"] and abs(data["target_qty"] - before["target_qty"]) > 1e-9:
+            data["auto_target"] = 0   # you've set your own target: it no longer follows the household
         cols = ", ".join("%s = ?" % k for k in data)
-        db.execute("UPDATE items SET %s, updated_at = ? WHERE id = ?" % cols,
+        db.execute("UPDATE items SET %s, updated_at = ?, rev = rev + 1 WHERE id = ?" % cols,
                    list(data.values()) + [now_iso(), item_id])
         add_log("edited", get_item(db, item_id)["name"], "Details updated")
     return {"ok": True}
@@ -857,6 +1194,7 @@ def api_item_delete(body, query, item_id):
         snap = snapshot(db, item_id)
         db.execute("DELETE FROM items WHERE id = ?", (item_id,))
         add_log("removed", snap["item"]["name"], "Item deleted")
+        undo_of(db, snap, item_id)
     return {"undo": snap}
 
 
@@ -888,6 +1226,7 @@ def api_items_delete(body, query):
                 continue   # already gone (deleted on another phone)
             snaps.append(snapshot(db, item_id))
             db.execute("DELETE FROM items WHERE id = ?", (item_id,))
+            snaps[-1]["after"] = None
         if not snaps:
             raise ApiError(404, "Those items no longer exist")
         names = [sn["item"]["name"] for sn in snaps]
@@ -952,6 +1291,9 @@ def api_use(body, query, item_id):
             raise ApiError(409, "There's none of that left to use")
         touch(db, item_id)
         add_log("used", item["name"], ("-%s %s" % (fq(used), item["unit"])).strip())
+        snap["usage"] = db.execute("INSERT INTO usage(item_id, ts, qty) VALUES (?, ?, ?)",
+                                   (item_id, now_iso(), used)).lastrowid
+        undo_of(db, snap, item_id)
     return {"used": used, "undo": snap}
 
 
@@ -982,6 +1324,7 @@ def api_batch_update(body, query, batch_id):
             else:
                 add_log("adjusted", b["name"], "Batch details updated")
         touch(db, b["item_id"])
+        undo_of(db, snap, b["item_id"])
     return {"undo": snap, "removed": qty <= 0}
 
 
@@ -997,6 +1340,7 @@ def api_batch_delete(body, query, batch_id):
         db.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
         touch(db, b["item_id"])
         add_log("adjusted", b["name"], ("Batch removed (%s %s)" % (fq(b["qty"]), b["unit"])))
+        undo_of(db, snap, b["item_id"])
     return {"undo": snap}
 
 
@@ -1014,27 +1358,52 @@ def api_restore_item(body, query):
         if not isinstance(snap, dict) or not isinstance(snap.get("item"), dict) or not isinstance(snap.get("batches"), list):
             raise ApiError(400, "Nothing to restore")
     with tx() as db:
-        names = [restore_snapshot(db, snap) for snap in snaps]
+        names, skipped = [], []
+        for snap in snaps:
+            name = restore_snapshot(db, snap)
+            (names if name[1] else skipped).append(name[0])
+        if not names:
+            if len(skipped) == 1:
+                raise ApiError(409, "%s has been changed since (on another phone, or by Home Assistant), "
+                                    "so it wasn't undone" % skipped[0])
+            raise ApiError(409, "Those have been changed since, so they weren't undone")
         if len(names) == 1:
             add_log("undo", names[0], "Change undone")
         else:
             add_log("undo", "%d items" % len(names), "Put back: " + name_list(names))
-    return {"ok": True, "restored": len(names)}
+    return {"ok": True, "restored": len(names), "skipped": skipped}
 
 
 def restore_snapshot(db, snap):
+    """Put an item back as it was: (name, True). If it has been changed since the change being undone
+    (another phone used some, or deleted it), leave it alone: (name, False)."""
     item = snap["item"]
     batches = snap["batches"]
     item_id = as_int_id(item.get("id"))
     data = clean_item(item)
     created = clean_text(item.get("created_at"), 30) or now_iso()
-    exists = db.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone()
+    exists = db.execute("SELECT rev FROM items WHERE id = ?", (item_id,)).fetchone()
+    if "after" in snap:   # undos from 1.11.0 on say what the item should look like now
+        after = snap["after"]
+        if after is not None and not isinstance(after, int):
+            raise ApiError(400, "Nothing to restore")
+        if (after is None) != (exists is None) or (exists is not None and exists["rev"] != after):
+            return data["name"], False
+    old_rev = item.get("rev") if isinstance(item.get("rev"), int) and not isinstance(item.get("rev"), bool) else 0
     if exists:
         cols = ", ".join("%s = ?" % k for k in data)
-        db.execute("UPDATE items SET %s, updated_at = ? WHERE id = ?" % cols,
+        db.execute("UPDATE items SET %s, updated_at = ?, rev = rev + 1 WHERE id = ?" % cols,
                    list(data.values()) + [now_iso(), item_id])
     else:
         insert_item(db, data, created, now_iso(), item_id)
+        db.execute("UPDATE items SET rev = ? WHERE id = ?", (max(0, old_rev) + 1, item_id))
+    for col in ("starter", "auto_target"):   # not part of clean_item: put them back as they were
+        if col in item:
+            v = clean_text(item.get(col), 120) if col == "starter" else (1 if item.get(col) else 0)
+            db.execute("UPDATE items SET %s = ? WHERE id = ?" % col, (v, item_id))
+    usage = snap.get("usage")
+    if isinstance(usage, int) and not isinstance(usage, bool):
+        db.execute("DELETE FROM usage WHERE id = ? AND item_id = ?", (usage, item_id))
     db.execute("DELETE FROM batches WHERE item_id = ?", (item_id,))
     for b in batches:
         if not isinstance(b, dict):
@@ -1044,7 +1413,7 @@ def restore_snapshot(db, snap):
             db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at) VALUES (?, ?, ?, ?, ?)",
                        (item_id, q, clean_date(b.get("expiry")), clean_text(b.get("location"), 80),
                         clean_text(b.get("added_at"), 30) or now_iso()))
-    return data["name"]
+    return data["name"], True
 
 
 @route("POST", "/api/shopping")
@@ -1101,6 +1470,11 @@ CHECK_SUGGESTIONS = [
     ("Go through the emergency plan together", 365,
      "Everyone knows where to meet and who to call. Update any numbers that have changed."),
 ]
+
+
+def check_print(c):
+    """What an undo expects a check to still look like."""
+    return [c["name"], c["every_days"], c["last_done"], c["notes"]]
 
 
 def all_checks():
@@ -1170,7 +1544,8 @@ def api_check_done(body, query, cid):
         db.execute("UPDATE checks SET last_done = ? WHERE id = ?", (when, cid))
         due = dt.date.fromisoformat(when) + dt.timedelta(days=before["every_days"])
         add_log("checked", before["name"], "Next due %s" % human_date(due))
-    return {"undo": {"check": before}, "next_due": due.isoformat()}
+        after = check_print(get_check(db, cid))
+    return {"undo": {"check": before, "after": after}, "next_due": due.isoformat()}
 
 
 @route("DELETE", r"/api/checks/(\d+)")
@@ -1180,7 +1555,7 @@ def api_check_delete(body, query, cid):
         before = get_check(db, cid)
         db.execute("DELETE FROM checks WHERE id = ?", (cid,))
         add_log("removed", before["name"], "Check deleted")
-    return {"undo": {"check": before}}
+    return {"undo": {"check": before, "after": None}}
 
 
 @route("POST", "/api/checks/restore")
@@ -1192,6 +1567,10 @@ def api_check_restore(body, query):
     cid = as_int_id(c.get("id"))
     data = clean_check(c)
     with tx() as db:
+        if "after" in body:   # from 1.11.0: don't undo over a newer change (another phone, or Home Assistant)
+            row = db.execute("SELECT * FROM checks WHERE id = ?", (cid,)).fetchone()
+            if (body["after"] is None) != (row is None) or (row is not None and check_print(row) != body["after"]):
+                raise ApiError(409, "%s has been changed since, so it wasn't undone" % data["name"])
         db.execute("INSERT OR REPLACE INTO checks(id, name, every_days, last_done, notes, created_at)"
                    " VALUES (?, ?, ?, ?, ?, ?)", (cid, data["name"], data["every_days"], data["last_done"],
                                                   data["notes"], clean_text(c.get("created_at"), 30) or now_iso()))
@@ -1723,7 +2102,7 @@ def res_context(items, st, plan, checks, warnings_on, food_days, water_days, tod
     return {"items": items, "plan": plan, "checks": checks, "warnings_on": warnings_on, "home": home,
             "ha": bool(HA_TOKEN), "answers": answers, "food_days": food_days, "water_days": water_days,
             "target": st["target_days"], "children": st["children"], "today": today,
-            "pets": bool(plan.get("pets")) or any(it["category"] == "pets" for it in items)}
+            "pets": bool(plan.get("pets")) or pets_count(st) > 0 or any(it["category"] == "pets" for it in items)}
 
 
 @route("POST", "/api/resilience/answer")
@@ -1762,27 +2141,19 @@ def api_res_add(body, query):
     if mid == "water_3" or (r["test"][0] == "days" and r["test"][1] == "water"):
         specs = [I("drinking water", r"bottled water|water \(", "Bottled water (5L)", cats=("water",))]
     added, ids, checks = [], [], []
-    rows = {row[0]: row for row in STARTER + EXTRA_ITEMS}
+    rows = starter_rows()
     with tx() as db:
-        st = get_settings()
-        people = max(1, st["adults"] + st["children"])
-        days = st["target_days"]
-        ctx = {"people": people, "days": days,
-               "kcal": max(1, st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]) * days,
-               "litres": people * st["water_per_person"] * days}
+        ctx = starter_ctx(get_settings())
         items = all_items()
         names = set(it["name"].lower() for it in items)
         ts = now_iso()
         for spec in specs:
             if _found(items, spec) or not spec["add"] or spec["add"].lower() in names:
                 continue
-            name, cat, unit, kcal, litres, target, notes = rows[spec["add"]]
-            per_day = round(people * target[1], 3) if isinstance(target, tuple) and target[0] == "perday" else 0
-            ids.append(insert_item(db, {"name": name, "category": cat, "unit": unit, "kcal_per_unit": kcal,
-                                        "litres_per_unit": litres, "target_qty": resolve_target(target, kcal, litres, ctx),
-                                        "per_day": per_day, "price": 0, "notes": notes}, ts, ts))
-            added.append(name)
-            names.add(name.lower())
+            row = rows[spec["add"]]
+            ids.append(add_starter(db, row, ctx, ts))
+            added.append(row[0])
+            names.add(row[0].lower())
         have = [row[0] for row in db.execute("SELECT name FROM checks")]
         for rx in rxs:
             if any(re.search(rx, n, re.I) for n in have):
@@ -1805,17 +2176,38 @@ def api_res_add(body, query):
 @route("PUT", "/api/settings")
 def api_settings(body, query):
     changed = []
+    rescaled = 0
     with tx() as db:
+        before = get_settings()
         for key, (lo, hi, integer) in SETTING_RULES.items():
             if key in body:
-                v = clean_num(body.get(key), DEFAULT_SETTINGS[key], lo, hi, key)
+                v = clean_num(body.get(key), DEFAULT_SETTINGS[key], lo, hi, SETTING_LABELS.get(key, key))
                 if integer:
                     v = int(round(v))
                 db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(v)))
-                changed.append(key)
+                if v != before[key]:
+                    changed.append(key)
+        if "warn_by_cat" in body:
+            v = clean_warn_by_cat(body.get("warn_by_cat"))
+            set_setting_raw(db, "warn_by_cat", v)
+            if v != before["warn_by_cat"]:
+                changed.append("warn_by_cat")
         if changed:
             add_log("settings", "", "Household settings updated")
-    return {"changed": changed}
+        if any(k in SCALES_TARGETS for k in changed):
+            rescaled = rescale_targets(db, before, get_settings())
+            if rescaled:
+                add_log("settings", "", "Targets for %d thing%s from the starter list now suit the household"
+                        % (rescaled, "" if rescaled == 1 else "s"))
+    return {"changed": changed, "rescaled": rescaled}
+
+
+def starter_ctx(st):
+    people = max(1, st["adults"] + st["children"])
+    days = st["target_days"]
+    return {"people": people, "days": days, "dogs": st["dogs"], "cats": st["cats"], "pets": pets_count(st),
+            "kcal": max(1, st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]) * days,
+            "litres": (people * st["water_per_person"] + pets_water(st)) * days}
 
 
 def resolve_target(spec, kcal, litres, ctx):
@@ -1830,37 +2222,121 @@ def resolve_target(spec, kcal, litres, ctx):
         return max(1, int(math.ceil(ctx["people"] * v)))
     if kind == "perday":
         return max(1, int(math.ceil(ctx["people"] * ctx["days"] * v)))
+    # Pets' things: none wanted if there are no such pets.
+    if kind == "dogday":
+        return int(math.ceil(ctx["dogs"] * ctx["days"] * v - 1e-9))
+    if kind == "catday":
+        return int(math.ceil(ctx["cats"] * ctx["days"] * v - 1e-9))
+    if kind == "pets":
+        return int(math.ceil(ctx["pets"] * v)) if ctx["pets"] else 0
     return 1
+
+
+def starter_per_day(spec, ctx):
+    """Things used every day also say how long they'll last."""
+    if not isinstance(spec, tuple):
+        return 0
+    n = {"perday": ctx["people"], "dogday": ctx["dogs"], "catday": ctx["cats"]}.get(spec[0])
+    return round(n * spec[1], 3) if n is not None else 0
+
+
+def starter_wanted(spec, ctx):
+    """Pet food only when there are pets of that kind."""
+    if isinstance(spec, tuple) and spec[0] in PET_SPECS:
+        return {"dogday": ctx["dogs"], "catday": ctx["cats"], "pets": ctx["pets"]}[spec[0]] > 0
+    return True
+
+
+def add_starter(db, row, ctx, ts):
+    name, cat, unit, kcal, litres, target, notes = row
+    item_id = insert_item(db, {"name": name, "category": cat, "unit": unit, "kcal_per_unit": kcal,
+                               "litres_per_unit": litres, "target_qty": resolve_target(target, kcal, litres, ctx),
+                               "per_day": starter_per_day(target, ctx), "price": 0, "notes": notes}, ts, ts)
+    db.execute("UPDATE items SET starter = ?, auto_target = ? WHERE id = ?",
+               (name, 1 if isinstance(target, tuple) else 0, item_id))
+    return item_id
+
+
+def starter_rows():
+    return dict((r[0], r) for r in STARTER + EXTRA_ITEMS)
+
+
+def rescale_targets(db, old_st, new_st):
+    """The household or the readiness target changed: targets from the starter list that you haven't
+    changed yourself follow it. So do their daily use, if that's still what the starter list set."""
+    rows = starter_rows()
+    old, new = starter_ctx(old_st), starter_ctx(new_st)
+    n = 0
+    for it in db.execute("SELECT id, starter, target_qty, per_day, auto_target FROM items WHERE starter != ''").fetchall():
+        row = rows.get(it["starter"])
+        if not row or not isinstance(row[5], tuple):
+            continue
+        spec, kcal, litres = row[5], row[3], row[4]
+        sets = {}
+        if it["auto_target"]:
+            t = resolve_target(spec, kcal, litres, new)
+            if abs(t - it["target_qty"]) > 1e-9:
+                sets["target_qty"] = t
+        if it["per_day"] and abs(it["per_day"] - starter_per_day(spec, old)) < 1e-6:
+            p = starter_per_day(spec, new)
+            if abs(p - it["per_day"]) > 1e-9:
+                sets["per_day"] = p
+        if sets:
+            db.execute("UPDATE items SET %s, updated_at = ?, rev = rev + 1 WHERE id = ?"
+                       % ", ".join("%s = ?" % k for k in sets), list(sets.values()) + [now_iso(), it["id"]])
+            n += 1
+    return n
+
+
+def guess_starter(name, target, ctx, rows=None):
+    """(starter name, follows the household?) for something that may have come from the starter list. A target
+    still at what the starter list would give now is taken to be the starter list's."""
+    row = (rows or starter_rows()).get(name)
+    if not row:
+        return "", 0
+    auto = isinstance(row[5], tuple) and abs(resolve_target(row[5], row[3], row[4], ctx) - target) < 1e-9
+    return row[0], 1 if auto else 0
+
+
+def mark_starter_items(db):
+    """Databases from before 1.11.0: find what came from the starter list, once."""
+    if setting_raw("starter_marked", False):
+        return
+    rows, ctx = starter_rows(), starter_ctx(get_settings())
+    for it in db.execute("SELECT id, name, target_qty FROM items WHERE starter = ''").fetchall():
+        name, auto = guess_starter(it["name"], it["target_qty"], ctx, rows)
+        if name:
+            db.execute("UPDATE items SET starter = ?, auto_target = ? WHERE id = ?", (name, auto, it["id"]))
+    set_setting_raw(db, "starter_marked", True)
 
 
 @route("POST", "/api/seed")
 def api_seed(body, query):
     """Add the suggested starter list (at zero stock), skipping names that already exist."""
     with tx() as db:
-        st = get_settings()
-        people = max(1, st["adults"] + st["children"])
-        days = st["target_days"]
-        ctx = {
-            "people": people,
-            "days": days,
-            "kcal": max(1, st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]) * days,
-            "litres": people * st["water_per_person"] * days,
-        }
+        ctx = starter_ctx(get_settings())
         existing = set(r[0].lower() for r in db.execute("SELECT name FROM items"))
         ts = now_iso()
         added = 0
-        for name, cat, unit, kcal, litres, target, notes in STARTER:
-            if name.lower() in existing:
+        for row in STARTER:
+            if row[0].lower() in existing or not starter_wanted(row[5], ctx):
                 continue
-            # Things used every day also say how long they'll last.
-            per_day = round(people * target[1], 3) if isinstance(target, tuple) and target[0] == "perday" else 0
-            insert_item(db, {"name": name, "category": cat, "unit": unit, "kcal_per_unit": kcal,
-                             "litres_per_unit": litres, "target_qty": resolve_target(target, kcal, litres, ctx),
-                             "per_day": per_day, "price": 0, "notes": notes}, ts, ts)
+            add_starter(db, row, ctx, ts)
             added += 1
         if added:
             add_log("starter", "", "Loaded %d suggested items" % added)
     return {"added": added}
+
+
+FORMULA_START = ("=", "+", "-", "@", "\t", "\r", "\n", "＝", "＋", "－", "＠")
+
+
+def csv_text(s):
+    """Text for a spreadsheet cell. Excel, Numbers and Google Sheets run a cell that starts with = + - or @
+    as a formula, so a name like '=HYPERLINK(...)' could do something when the file is opened. A leading
+    apostrophe makes it plain text (the usual fix; spreadsheets hide the apostrophe)."""
+    s = "" if s is None else str(s)
+    return "'" + s if s.lstrip(" ").startswith(FORMULA_START) else s
 
 
 @route("GET", r"/api/export\.csv")
@@ -1875,10 +2351,11 @@ def api_export_csv(body, query):
                                            i["name"].lower())):
         rows = it["batches"] or [{"qty": 0, "expiry": "", "location": ""}]
         for b in rows:
-            w.writerow([it["category"], it["name"], fq(b["qty"]), it["unit"], b["expiry"] or "", b["location"],
+            w.writerow([csv_text(it["category"]), csv_text(it["name"]), fq(b["qty"]), csv_text(it["unit"]),
+                        b["expiry"] or "", csv_text(b["location"]),
                         fq(it["target_qty"]), fq(it["kcal_per_unit"]), fq(it["litres_per_unit"]),
                         fq(it["per_day"]) if it["per_day"] else "", "%.2f" % it["price"] if it["price"] else "",
-                        it["notes"]])
+                        csv_text(it["notes"])])
     data = ("﻿" + buf.getvalue()).encode("utf-8")  # BOM so Excel opens it as UTF-8
     return Raw(data, "text/csv; charset=utf-8", "dadsarmy-stores-%s.csv" % dt.date.today().isoformat())
 
@@ -1886,12 +2363,19 @@ def api_export_csv(body, query):
 @route("GET", r"/api/backup\.json")
 def api_backup(body, query):
     with LOCK:
+        items = all_items()
+        used = {}
+        for r in DB.execute("SELECT item_id, ts, qty FROM usage ORDER BY id"):
+            used.setdefault(r["item_id"], []).append([r["ts"], r["qty"]])
+        for it in items:
+            it["usage"] = used.get(it["id"], [])
         payload = {
             "app": "dadsarmy",
             "version": VERSION,
             "exported_at": now_iso(),
             "settings": get_settings(),
-            "items": all_items(),
+            "items": items,
+            "history": [dict(r) for r in DB.execute("SELECT * FROM history ORDER BY day")],
             "shopping": [dict(r) for r in DB.execute("SELECT * FROM shopping ORDER BY id")],
             "checks": all_checks(),
             "plan": get_plan(),
@@ -1909,6 +2393,8 @@ def api_restore(body, query):
     items = body["items"]
     shopping = body.get("shopping") if isinstance(body.get("shopping"), list) else []
     settings = body.get("settings") if isinstance(body.get("settings"), dict) else {}
+    if len(items) > 20000:
+        raise ApiError(400, "That backup has more items than Dads Army can take")
     # Validate everything before touching the database.
     clean_items = []
     for it in items:
@@ -1916,13 +2402,44 @@ def api_restore(body, query):
             raise ApiError(400, "Backup file is damaged")
         data = clean_item(it)
         bl = []
-        for b in it.get("batches") or []:
+        batches = it.get("batches") or []
+        if not isinstance(batches, list):
+            raise ApiError(400, "Backup file is damaged")
+        for b in batches:
             if isinstance(b, dict):
                 q = clean_num(b.get("qty"), 0, 0, 1e7)
                 if q > 0:
                     bl.append((q, clean_date(b.get("expiry")), clean_text(b.get("location"), 80),
                                clean_text(b.get("added_at"), 30) or now_iso()))
-        clean_items.append((data, clean_text(it.get("created_at"), 30) or now_iso(), bl))
+        used = []   # 1.11.0 on: what was used when
+        for u in (it.get("usage") if isinstance(it.get("usage"), list) else [])[-2000:]:
+            if isinstance(u, list) and len(u) == 2 and isinstance(u[0], str) and DATE_RE.match(u[0][:10]):
+                q = clean_num(u[1], 0, 0, 1e7)
+                if q > 0:
+                    used.append((clean_text(u[0], 30), q))
+        starter = None
+        if isinstance(it.get("starter"), str):
+            starter = (clean_text(it.get("starter"), 120), 1 if it.get("auto_target") else 0)
+        clean_items.append((data, clean_text(it.get("created_at"), 30) or now_iso(), bl, used, starter))
+    # A backup with nothing in it would empty the stores: make sure that's what you meant.
+    with LOCK:
+        have = DB.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+    if not clean_items and have and body.get("confirm_empty") is not True:
+        raise ApiError(409, "That backup has nothing in the stores. Restoring it would delete all %d things you have "
+                            "now." % have, "empty_backup")
+    settings_in = {}
+    for key, (lo, hi, integer) in SETTING_RULES.items():
+        if key in settings:
+            v = clean_num(settings.get(key), DEFAULT_SETTINGS[key], lo, hi, SETTING_LABELS.get(key, key))
+            settings_in[key] = int(round(v)) if integer else v
+    warn_by_cat = clean_warn_by_cat(settings["warn_by_cat"]) if isinstance(settings.get("warn_by_cat"), dict) else None
+    history = None
+    if isinstance(body.get("history"), list):
+        history = []
+        for h in body["history"][-4000:]:
+            if isinstance(h, dict) and isinstance(h.get("day"), str) and DATE_RE.fullmatch(h["day"]):
+                history.append(dict((k, clean_num(h.get(k), 0, -1, 1e9, k)) for k in HISTORY_FIELDS))
+                history[-1]["day"] = h["day"]
     # Checks and the plan arrived in 1.5.0: an older backup leaves the ones you have alone.
     checks = None
     if isinstance(body.get("checks"), list):
@@ -1945,26 +2462,40 @@ def api_restore(body, query):
         answers = dict((k, {"status": v["status"], "at": clean_text(v.get("at"), 30) or now_iso()})
                        for k, v in body["resilience"].items()
                        if k in RES and isinstance(v, dict) and v.get("status") in ("yes", "na"))
-    make_backup("pre-restore")
+    try:
+        make_backup("pre-restore")
+    except Exception as e:
+        raise ApiError(500, "Couldn't save a copy of what you have now, so nothing was restored (%s)" % e)
     ts = now_iso()
     with tx() as db:
         db.execute("DELETE FROM batches")
         db.execute("DELETE FROM items")
         db.execute("DELETE FROM shopping")
-        for data, created, bl in clean_items:
+        db.execute("DELETE FROM usage")
+        for key, v in settings_in.items():
+            db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(v)))
+        if warn_by_cat is not None:
+            set_setting_raw(db, "warn_by_cat", warn_by_cat)
+        ctx, rows = starter_ctx(get_settings()), starter_rows()
+        for data, created, bl, used, starter in clean_items:
             new_id = insert_item(db, data, created, ts)
             for q, exp, loc, added in bl:
                 db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at) VALUES (?, ?, ?, ?, ?)",
                            (new_id, q, exp, loc, added))
+            for when, q in used:
+                db.execute("INSERT INTO usage(item_id, ts, qty) VALUES (?, ?, ?)", (new_id, when, q))
+            name, auto = starter if starter is not None else guess_starter(data["name"], data["target_qty"], ctx, rows)
+            if name:
+                db.execute("UPDATE items SET starter = ?, auto_target = ? WHERE id = ?", (name, auto, new_id))
         for s in shopping:
             if isinstance(s, dict) and clean_text(s.get("text"), 200):
                 db.execute("INSERT INTO shopping(text, done, created_at) VALUES (?, ?, ?)",
                            (clean_text(s.get("text"), 200), 1 if s.get("done") else 0, ts))
-        for key, (lo, hi, integer) in SETTING_RULES.items():
-            if key in settings:
-                v = clean_num(settings.get(key), DEFAULT_SETTINGS[key], lo, hi, key)
-                db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
-                           (key, json.dumps(int(round(v)) if integer else v)))
+        if history is not None:
+            for h in history:
+                db.execute("INSERT OR REPLACE INTO history(%s) VALUES (%s)" % (
+                    ", ".join(("day",) + HISTORY_FIELDS), ", ".join("?" * (len(HISTORY_FIELDS) + 1))),
+                    [h["day"]] + [h[k] for k in HISTORY_FIELDS])
         if checks is not None:
             db.execute("DELETE FROM checks")
             for c, created in checks:
@@ -1991,15 +2522,66 @@ def list_backups(suffix="-auto.db"):
         return []
 
 
+class BackupError(Exception):
+    pass
+
+
+def check_backup(path):
+    """Open a backup copy on its own and make sure it's sound and really is Dads Army's: SQLite's own
+    integrity check, the tables there, and the same number of items as the live database."""
+    conn = sqlite3.connect("file:%s?mode=ro" % path.replace("?", "%3f").replace("#", "%23"), uri=True)
+    try:
+        ok = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if ok != "ok":
+            raise BackupError("the copy is damaged (%s)" % ok)
+        tables = set(r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'"))
+        if not {"items", "batches", "settings"} <= tables:
+            raise BackupError("the copy is missing tables")
+        return conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+    except sqlite3.DatabaseError as e:
+        raise BackupError("the copy can't be read (%s)" % e)
+    finally:
+        conn.close()
+
+
 def make_backup(tag="auto"):
-    name = "dadsarmy-%s-%s.db" % (dt.datetime.now().strftime("%Y%m%d-%H%M%S"), tag)
-    path = os.path.join(BACKUP_DIR, name)
-    with LOCK:
-        dest = sqlite3.connect(path)
-        try:
-            DB.backup(dest)
-        finally:
-            dest.close()
+    """Copy the database to a new, dated file. The copy is written under a temporary name and checked;
+    only then is it given its real name, and only then are old copies cleared out. A name that's
+    already taken (two backups in the same second) gets a number, so nothing is ever overwritten."""
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    tmp = os.path.join(BACKUP_DIR, ".dadsarmy-%s-%s-%d.tmp" % (stamp, tag, os.getpid()))
+    try:
+        with LOCK:
+            dest = sqlite3.connect(tmp)
+            try:
+                DB.backup(dest)
+                dest.execute("PRAGMA journal_mode = DELETE")   # one self-contained file, no -wal beside it
+            finally:
+                dest.close()
+            want = DB.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        got = check_backup(tmp)
+        if got != want:
+            raise BackupError("the copy has %d items, not %d" % (got, want))
+        n = 0
+        while True:
+            name = "dadsarmy-%s-%s.db" % (stamp + ("" if not n else chr(96 + n)), tag)   # ...-101010b-auto.db
+            path = os.path.join(BACKUP_DIR, name)
+            try:   # O_EXCL: claim the name, so a copy made at the same moment can't take it too
+                os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                break
+            except FileExistsError:
+                n += 1
+                if n > 26:
+                    raise BackupError("no free name for the copy")
+        os.replace(tmp, path)
+    except Exception:
+        for f in (tmp, tmp + "-wal", tmp + "-shm", tmp + "-journal"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        raise
     for old in list_backups()[:-KEEP_BACKUPS]:
         try:
             os.remove(os.path.join(BACKUP_DIR, old))
@@ -2016,6 +2598,12 @@ def make_backup(tag="auto"):
 
 
 def backup_loop():
+    for f in os.listdir(BACKUP_DIR) if os.path.isdir(BACKUP_DIR) else []:
+        if f.startswith(".dadsarmy-") and f.endswith(".tmp"):   # left by a power cut mid-backup
+            try:
+                os.remove(os.path.join(BACKUP_DIR, f))
+            except OSError:
+                pass
     while True:
         try:
             existing = list_backups()
@@ -2024,6 +2612,9 @@ def backup_loop():
                 LAST_BACKUP["at"] = dt.datetime.fromtimestamp(newest).replace(microsecond=0).isoformat(sep=" ")
             if time.time() - newest > 20 * 3600:
                 make_backup("auto")
+        except BackupError as e:
+            print("Daily backup: not kept, because %s. The earlier backups are still there; "
+                  "will try again in an hour." % e, flush=True)
         except Exception:
             traceback.print_exc()
         time.sleep(3600)
@@ -2037,6 +2628,7 @@ HA_API = os.environ.get("DADSARMY_HA_API", "http://supervisor/core/api").rstrip(
 HA_WAKE = threading.Event()
 HA_REBASE = threading.Event()  # set after a restore: those stock changes aren't things running out
 HA_LAST = {}  # entity_id -> last body sent
+RAN_OUT_PENDING = {}  # item id -> when it ran out, until Home Assistant has been told (see ha_loop)
 TODO_LOCK = threading.Lock()
 TODO_STATUS = {"ok": None, "error": "", "synced_at": None, "name": ""}
 TODO_RE = re.compile(r"^todo\.[a-z0-9_]+$")
@@ -2045,7 +2637,7 @@ CHECKS_LIST_NAME = "Dads Army checks"
 CHECKS_STATUS = {"ok": None, "error": "", "synced_at": None, "name": ""}
 HA_WS = os.environ.get("DADSARMY_HA_WS", "ws://supervisor/core/websocket")
 DASH_URL = "dads-army"
-DASH_LAYOUT = 5   # bump when the dashboard changes, so the app offers to rebuild it
+DASH_LAYOUT = 6   # bump when the dashboard changes, so the app offers to rebuild it
 
 
 class HAError(Exception):
@@ -2147,6 +2739,11 @@ def ha_entities(s):
         "mdi:alert-octagon" if w["serious"] else "mdi:alert-outline" if w["count"] else "mdi:shield-check-outline",
         "warnings", dict(_ha_list(w["items"]), highest=w["highest"], max_severity=w["max_severity"],
                          enabled=w["enabled"], checked_at=w["checked_at"], health_news=w["news"]))
+    live = w.get("live") or []
+    watch = sum(1 for r in live if r["state"] != "good")
+    put("sensor.dads_army_live", watch, "Dads Army wider picture",
+        "mdi:earth-box" if not watch else "mdi:earth-box-minus", "alerts",
+        {"rows": live, "enabled": w["enabled"], "checked_at": w["checked_at"]})
     sit = s["situation"]
     put("sensor.dads_army_alert_level", sit["name"], "Dads Army alert level", LEVEL_ICONS[sit["level"] - 1],
         attrs={"level": sit["level"], "colour": sit["colour"], "emoji": sit["emoji"], "meaning": sit["meaning"],
@@ -2236,8 +2833,11 @@ def and_join(words):
 
 def ran_out(before, now):
     """Event data for items that had stock last time and have none now (None if nothing ran out)."""
-    gone = sorted((now[i] for i in now if i in before and before[i]["total"] > 0 and now[i]["total"] <= 0),
-                  key=lambda r: r["name"].lower())
+    return ran_out_event([now[i] for i in now if i in before and before[i]["total"] > 0 and now[i]["total"] <= 0])
+
+
+def ran_out_event(gone):
+    gone = sorted(gone, key=lambda r: r["name"].lower())
     if not gone:
         return None
     items = [{"name": g["name"], "unit": g["unit"] or "", "target": _num(g["target_qty"] or 0),
@@ -2844,6 +3444,19 @@ def app_panel():
     return "/" + host.replace("-", "_") if re.match(r"^[0-9a-f]{8}-dadsarmy$", host) else "/40ee45c0_dadsarmy"
 
 
+DASH_LIVE = """{% set a = 'sensor.dads_army_live' -%}
+{% set rows = state_attr(a, 'rows') or [] -%}
+{% if states(a) in ['unknown', 'unavailable'] -%}
+Dads Army isn't sending updates. Check the app is running.
+{%- elif not state_attr(a, 'enabled') -%}
+Comes with warnings: turn them on in Dads Army under **HQ → Warnings**.
+{%- elif not rows -%}
+Nothing yet: Dads Army checks the feeds every 15 minutes.
+{%- else -%}
+{% for r in rows %}{{ r.dot }} {{ r.emoji }} **{{ r.name }}:** {{ r.text }}<br>
+{% endfor %}<small>From the Environment Agency, the power networks, NESO, National Gas, Defra, NOAA and the Bank of England.</small>
+{%- endif %}"""
+
 DASH_WARNINGS = """{% set w = state_attr('sensor.dads_army_warnings', 'items') or [] -%}
 {% if states('sensor.dads_army_warnings') in ['unknown', 'unavailable'] -%}
 Dads Army isn't sending updates. Check the app is running.
@@ -3110,6 +3723,10 @@ def dashboard_config():
             dict(tile("sensor.dads_army_supply_run", "To get"), **full)] + shopping + [
             dict({"type": "button", "name": "Open Dads Army", "icon": "mdi:open-in-app", "show_state": False,
                   "tap_action": {"action": "navigate", "navigation_path": app_panel()}}, **full)]},
+        # The wider picture: rivers, power cuts, the grid, gas, air, space weather, the pound.
+        {"type": "grid", "cards": [
+            heading("The wider picture", "mdi:earth"),
+            dict({"type": "markdown", "content": DASH_LIVE}, **full)]},
         {"type": "grid", "cards": [
             heading("Days you could last", "mdi:chart-line"),
             dict({"type": "history-graph", "hours_to_show": 720, "entities": [
@@ -3220,65 +3837,94 @@ def level_change(sit):
 # -- The background loop -------------------------------------------------------
 def ha_loop():
     """Keep Home Assistant's Dads Army sensors and to-do list up to date."""
-    probe = "sensor.dads_army_hold_out"
-    sent, failing, last_full, levels = {}, False, None, None
+    state = ha_state_new()
     HA_WAKE.set()  # first push straight away
     while True:
-        HA_WAKE.wait(15 if failing else 30 if (todo_entity() or checks_entity()) else 60)
+        HA_WAKE.wait(15 if state["failing"] else 30 if (todo_entity() or checks_entity()) else 60)
         HA_WAKE.clear()
         time.sleep(1)  # let a burst of changes settle
         refresh_ha_home()   # where home is, for Places when warnings are off (once an hour at most)
+        ha_once(state)
+
+
+def ha_state_new():
+    return {"sent": {}, "failing": False, "last_full": None, "levels": None}
+
+
+def ha_once(state):
+    """One round: tell Home Assistant what's run out and what's changed. Returns True if it all got through."""
+    probe = "sensor.dads_army_hold_out"
+    sent = state["sent"]
+    try:
+        s = summary()
+        now = stock_levels()
+    except Exception:
+        traceback.print_exc()
+        return False
+    if HA_REBASE.is_set():
+        HA_REBASE.clear()
+        state["levels"] = None
+    # Things that have run out since last time, even while Home Assistant can't be reached: they're
+    # kept until it can be told. Anything restocked or deleted before then is dropped, as is anything
+    # still untold after a week.
+    levels = state["levels"]
+    if levels is not None:
+        for i in now:
+            if i in levels and levels[i]["total"] > 0 and now[i]["total"] <= 0:
+                RAN_OUT_PENDING.setdefault(i, time.time())
+    state["levels"] = now
+    for i in list(RAN_OUT_PENDING):
+        if i not in now or now[i]["total"] > 0 or time.time() - RAN_OUT_PENDING[i] > 7 * 86400:
+            RAN_OUT_PENDING.pop(i, None)
+    try:
+        if RAN_OUT_PENDING:
+            ev = ran_out_event([now[i] for i in RAN_OUT_PENDING])
+            status = ha_call("POST", "/events/dads_army_ran_out", ev)
+            if status not in (200, 201):
+                raise RuntimeError("Home Assistant answered %s" % status)
+            RAN_OUT_PENDING.clear()
+        ents = ha_entities(s)
+        full = state["last_full"] is None or time.monotonic() - state["last_full"] > 1800
+        if not full and ha_call("GET", "/states/" + probe, timeout=5) == 404:
+            full = True  # Home Assistant restarted and forgot them
+        for eid, body in ents.items():
+            payload = json.dumps(body, sort_keys=True)
+            if full or sent.get(eid) != payload:
+                status = ha_call("POST", "/states/" + eid, body)
+                if status not in (200, 201):
+                    raise RuntimeError("Home Assistant answered %s" % status)
+                sent[eid] = payload
+                HA_LAST[eid] = body
+        # Map points that are no longer wanted (home moved, a place deleted): take them off.
+        geo_now = sorted(e for e in ents if e.startswith("geo_location.dads_army_"))
+        with LOCK:
+            geo_old = setting_raw("ha_geo_ids", []) or []
+        if geo_old != geo_now:
+            for eid in set(geo_old) - set(geo_now):
+                ha_call("DELETE", "/states/" + eid)
+                sent.pop(eid, None)
+                HA_LAST.pop(eid, None)
+            with tx() as db:
+                set_setting_raw(db, "ha_geo_ids", geo_now)
+        if full:
+            state["last_full"] = time.monotonic()
+        level_change(s["situation"])
+        if state["failing"]:
+            print("Home Assistant sensors: connected again", flush=True)
+        state["failing"] = False
+    except Exception as e:
+        if not state["failing"]:
+            print("Home Assistant sensors: can't update them yet (%s). Will keep trying." % e, flush=True)
+        state["failing"], state["last_full"] = True, None
+        sent.clear()
+    if not state["failing"]:
+        todo_tick(s)
+        checks_tick()
         try:
-            s = summary()
-            now = stock_levels()
+            backfill_history()
         except Exception:
             traceback.print_exc()
-            continue
-        if HA_REBASE.is_set():
-            HA_REBASE.clear()
-            levels = None
-        try:
-            ev = ran_out(levels, now) if levels is not None and not failing else None
-            levels = now
-            if ev:
-                ha_call("POST", "/events/dads_army_ran_out", ev)
-            ents = ha_entities(s)
-            full = last_full is None or time.monotonic() - last_full > 1800
-            if not full and ha_call("GET", "/states/" + probe, timeout=5) == 404:
-                full = True  # Home Assistant restarted and forgot them
-            for eid, body in ents.items():
-                payload = json.dumps(body, sort_keys=True)
-                if full or sent.get(eid) != payload:
-                    status = ha_call("POST", "/states/" + eid, body)
-                    if status not in (200, 201):
-                        raise RuntimeError("Home Assistant answered %s" % status)
-                    sent[eid] = payload
-                    HA_LAST[eid] = body
-            # Map points that are no longer wanted (home moved, a place deleted): take them off.
-            geo_now = sorted(e for e in ents if e.startswith("geo_location.dads_army_"))
-            with LOCK:
-                geo_old = setting_raw("ha_geo_ids", []) or []
-            if geo_old != geo_now:
-                for eid in set(geo_old) - set(geo_now):
-                    ha_call("DELETE", "/states/" + eid)
-                    sent.pop(eid, None)
-                    HA_LAST.pop(eid, None)
-                with tx() as db:
-                    set_setting_raw(db, "ha_geo_ids", geo_now)
-            if full:
-                last_full = time.monotonic()
-            level_change(s["situation"])
-            if failing:
-                print("Home Assistant sensors: connected again", flush=True)
-            failing = False
-        except Exception as e:
-            if not failing:
-                print("Home Assistant sensors: can't update them yet (%s). Will keep trying." % e, flush=True)
-            failing, last_full = True, None
-            sent.clear()
-        if not failing:
-            todo_tick(s)
-            checks_tick()
+    return not state["failing"]
 
 
 def ha_mark_unavailable():
@@ -3399,6 +4045,24 @@ FEED_URLS = {
     # NASA FIRMS: satellite fire detections for Europe over the last 7 days (free, no account)
     "fires": "https://firms.modaps.eosdis.nasa.gov/data/active_fire/noaa-20-viirs-c2/csv/J1_VIIRS_C2_Europe_7d.csv",
     "fires_modis": "https://firms.modaps.eosdis.nasa.gov/data/active_fire/modis-c6.1/csv/MODIS_C6_1_Europe_7d.csv",
+    # Live information (1.12.0). Each is the whole country (or the whole network) in one go.
+    "rivers": "https://environment.data.gov.uk/flood-monitoring/data/readings?latest&parameter=level",
+    "river_stations": "https://environment.data.gov.uk/flood-monitoring/id/stations?parameter=level&_view=full",
+    "power_ukpn": "https://ukpowernetworks.opendatasoft.com/api/explore/v2.1/catalog/datasets/ukpn-live-faults/exports/json",
+    "power_nged": "https://connecteddata.nationalgrid.co.uk/dataset/d6672e1e-c684-4cea-bb78-c7e5248b62a2/resource/"
+                  "292f788f-4339-455b-8cc0-153e14509d4d/download/power_outage_ext.csv",
+    "power_ssen": "https://external.distribution.prd.ssen.co.uk/opendataportal-prd/v4/api/getallfaults",
+    "power_npg": "https://northernpowergrid.opendatasoft.com/api/explore/v2.1/catalog/datasets/live-power-cuts-data/"
+                 "exports/json",
+    "grid": "https://data.elexon.co.uk/bmrs/api/v1/datasets/SYSWARN/stream?publishDateTimeFrom={start}"
+            "&publishDateTimeTo={end}",
+    "gas": "https://data.nationalgas.com/api/find-gas-data-download?applicableFor=Y&dateFrom={start}&dateTo={end}"
+           "&dateType=GASDAY&latestFlag=Y&ids=PUBOBJ330,PUBOBJ333,PUBOBJ331,PUBOBJ332&type=CSV",
+    "air": "https://uk-air.defra.gov.uk/assets/rss/current_site_levels.xml",
+    "air_forecast": "https://uk-air.defra.gov.uk/assets/rss/forecast.xml",
+    "space": "https://services.swpc.noaa.gov/products/noaa-scales.json",
+    "pound": "https://www.bankofengland.co.uk/boeapps/database/_iadb-fromshowcolumns.asp?csv.x=yes&Datefrom={start}"
+             "&Dateto=now&SeriesCodes=XUDLUSS,XUDLERS,IUDBEDR&CSVF=TN&UsingCodes=Y&VPD=Y&VFD=N",
 }
 try:   # for testing against local copies
     FEED_URLS.update(json.loads(os.environ.get("DADSARMY_FEED_URLS") or "{}"))
@@ -3413,9 +4077,19 @@ WARN_SOURCES = [  # key, what it is, on by default
     ("fires", "Possible fires nearby (NASA satellites)", False),
     ("ukhsa", "UK Health Security Agency news", False),
     ("who", "WHO disease outbreak news", False),
+    # Live information (1.12.0)
+    ("rivers", "River levels near you (England)", True),
+    ("power", "Power cuts near you", True),
+    ("grid", "Electricity grid notices", True),
+    ("gas", "Gas storage", True),
+    ("air", "Air quality near you", True),
+    ("space", "Space weather", True),
+    ("pound", "The pound and Bank Rate", True),
 ]
 WARN_SOURCE_NAMES = {"metoffice": "Met Office", "floods": "Environment Agency", "govalerts": "GOV.UK Emergency Alerts",
-                     "gdacs": "GDACS", "fires": "NASA FIRMS", "ukhsa": "UKHSA", "who": "WHO"}
+                     "gdacs": "GDACS", "fires": "NASA FIRMS", "ukhsa": "UKHSA", "who": "WHO",
+                     "rivers": "Environment Agency", "power": "the power networks", "grid": "NESO / Elexon",
+                     "gas": "National Gas", "air": "Defra UK-AIR", "space": "NOAA", "pound": "Bank of England"}
 MET_REGIONS = [  # code, name, rough middle (to guess yours from Home Assistant's location)
     ("os", "Orkney & Shetland", 59.6, -2.0), ("he", "Highlands & Eilean Siar", 57.5, -5.0),
     ("gr", "Grampian", 57.2, -2.8), ("st", "Strathclyde", 55.8, -4.8),
@@ -3431,7 +4105,7 @@ WARN_DEFAULTS = {"on": False, "sources": {k: d for k, _, d in WARN_SOURCES}, "re
                  "flood_km": 20, "gdacs_km": 1000, "fire_km": 10}
 WARN_EVERY = 15 * 60      # seconds between checks
 FLOOD_LOOKUPS = 80        # flood areas to look up per check (they're kept once found)
-WARN_STATE = {"items": [], "news": [], "sources": {}, "checked_at": None, "region": "", "seen": {}}
+WARN_STATE = {"items": [], "news": [], "sources": {}, "checked_at": None, "region": "", "seen": {}, "live": {}}
 WARN_LOCK = threading.Lock()
 WARN_WAKE = threading.Event()
 WARN_DONE = threading.Condition()
@@ -3502,11 +4176,19 @@ def guess_region(loc):
 
 
 def http_get(url, timeout=20, limit=8 * 1024 * 1024):
-    req = urllib.request.Request(url, headers={"User-Agent": FEED_UA, "Accept": "*/*"})
+    """Fetch a public feed. Nothing goes with it but Dads Army's name: no cookies, no referrer, no location.
+    Asks for it compressed (some feeds are ten times smaller that way) and unpacks it here."""
+    req = urllib.request.Request(url, headers={"User-Agent": FEED_UA, "Accept": "*/*", "Accept-Encoding": "gzip"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data = r.read(limit + 1)
+        packed = (r.headers.get("Content-Encoding") or "").lower() == "gzip"
     if len(data) > limit:
         raise ValueError("the feed is too big")
+    if packed:
+        with gzip.GzipFile(fileobj=io.BytesIO(data)) as g:
+            data = g.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("the feed is too big")
     return data
 
 
@@ -3864,14 +4546,16 @@ def clean_places(body):
         if r.get("where"):
             lat, lon = parse_where(clean_text(r.get("where"), 600))
         else:
-            try:
-                lat, lon = float(r.get("lat")), float(r.get("lon"))
-            except (TypeError, ValueError):
+            if r.get("lat") in (None, "") or r.get("lon") in (None, ""):
                 raise ApiError(400, "Where is %s? Paste a map link or the coordinates." % name)
-            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            try:
+                lat = clean_num(r.get("lat"), None, -90, 90, "Latitude", 5)
+                lon = clean_num(r.get("lon"), None, -180, 180, "Longitude", 5)
+            except ApiError:
                 raise ApiError(400, "Those coordinates for %s aren't on the map" % name)
-        kind = r.get("kind") if r.get("kind") in OWN_KINDS else "other"
-        hz = [h for h in (r.get("hazards") or []) if h in HAZARD_KEYS]
+        kind = r.get("kind") if isinstance(r.get("kind"), str) and r.get("kind") in OWN_KINDS else "other"
+        hazards = r.get("hazards") if isinstance(r.get("hazards"), list) else []
+        hz = [h for h in hazards if isinstance(h, str) and h in HAZARD_KEYS]
         n += 1
         out.append({"id": n, "name": name, "lat": round(lat, 5), "lon": round(lon, 5), "kind": kind, "hazards": hz,
                     "notes": clean_text(r.get("notes"), 300)})
@@ -3917,6 +4601,8 @@ def active_hazards(s, items):
     for w in items:
         k, t = w.get("kind"), (w.get("title") or "").lower()
         if k == "flood" and (w.get("severity") or 0) >= 2:
+            act.append("flood")
+        if k == "river" and (w.get("severity") or 0) >= 2:   # a river higher than it's been for years
             act.append("flood")
         if k == "fire":
             act.append("fire")
@@ -4109,7 +4795,751 @@ def fires_near(home, km, hist, now, ignore=()):
     return out
 
 
+# -- Live information (1.12.0) -------------------------------------------------------------
+# The wider picture: rivers near home, power cuts nearby, the electricity grid, gas storage, air
+# quality, space weather and the pound. Like the warnings, each feed is public and fetched whole
+# (all of England's rivers, every power cut a network has): nothing about you is sent, and Dads Army
+# picks out what's near home itself. Each turns into a reading for the app and, when something's
+# up, a warning. Trend warnings ("emptying faster than last year") come from the feeds' own history.
+LIVE_KEYS = ("rivers", "power", "grid", "gas", "air", "space", "pound")
+LIVE_EVERY = {"rivers": 14 * 60, "power": 14 * 60, "grid": 14 * 60, "gas": 3 * 3600, "air": 55 * 60,
+              "space": 29 * 60, "pound": 6 * 3600}     # seconds between fetches: no more often than they change
+LIVE_CREDIT = {
+    "rivers": "Environment Agency flood and river level data from the real-time data API (Beta), under the Open "
+              "Government Licence",
+    "power": "Live power cut data from UK Power Networks, National Grid Electricity Distribution, SSEN and Northern "
+             "Powergrid, under their open data licences",
+    "grid": "System warnings from Elexon's BMRS (Insights), issued by NESO",
+    "gas": "GB gas storage from the National Gas data portal",
+    "air": "Daily Air Quality Index from Defra's UK-AIR, under the Open Government Licence",
+    "space": "Space weather scales from NOAA's Space Weather Prediction Center",
+    "pound": "Exchange rates and Bank Rate from the Bank of England database, under the Open Government Licence",
+}
+RIVER_KM = 10          # rivers this close count as near home
+RIVER_KEEP_KM = 30     # station details kept for this far, so a small move of home doesn't need a refetch
+POWER_KM = 10          # power cuts listed this far away
+POWER_NEAR_KM = 2      # ...and a warning this close
+AIR_KM = 40
+DAQI_BANDS = [(3, "Low"), (6, "Moderate"), (9, "High"), (10, "Very high")]
+G_WORDS = {0: "Quiet", 1: "Minor storm (G1)", 2: "Moderate storm (G2)", 3: "Strong storm (G3)",
+           4: "Severe storm (G4)", 5: "Extreme storm (G5)"}
+
+
+def _f0(v):
+    """A number from a feed, or None. Feeds send numbers, strings, '', null and lists."""
+    if isinstance(v, list):
+        v = v[0] if v else None
+    if isinstance(v, bool) or v in (None, ""):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _first(v):
+    return (v[0] if v else None) if isinstance(v, list) else v
+
+
+def _iso_age_h(s, now):
+    d = parse_when(s) if s else None
+    return (now - d).total_seconds() / 3600.0 if d else None
+
+
+def daqi_band(i):
+    for top, name in DAQI_BANDS:
+        if i <= top:
+            return name
+    return "Very high"
+
+
+def dms(text):
+    """'55&deg;47&acute;31.78&quot;N    3&deg;14&acute;34.44&quot;W' -> (55.792, -3.243)."""
+    t = htmllib.unescape(text or "")
+    found = re.findall(r"(\d+)\s*°\s*(\d+)\D{1,3}?([\d.]+)\D{0,3}?([NSEW])", t)
+    if len(found) < 2:
+        return None
+    out = []
+    for d, m, s, h in found[:2]:
+        v = int(d) + int(m) / 60.0 + float(s) / 3600.0
+        out.append(-v if h in "SW" else v)
+    return out[0], out[1]
+
+
+# -- Rivers ---------------------------------------------------------------------------------
+def parse_river_stations(data, home):
+    """Stations measuring river level within RIVER_KEEP_KM of home, with their usual range."""
+    doc = json.loads(data.decode("utf-8"))
+    out = []
+    for s in doc.get("items") or []:
+        if not isinstance(s, dict):
+            continue
+        lat, lon = _f0(s.get("lat")), _f0(s.get("long"))
+        if lat is None or lon is None:
+            continue
+        d = km_between(home["lat"], home["lon"], lat, lon)
+        if d > RIVER_KEEP_KM:
+            continue
+        ms = s.get("measures")
+        ms = ms if isinstance(ms, list) else [ms] if isinstance(ms, dict) else []
+        stage = [m for m in ms if isinstance(m, dict) and m.get("qualifier") == "Stage" and m.get("parameter") == "level"]
+        if not stage:
+            continue
+        sc = s.get("stageScale") if isinstance(s.get("stageScale"), dict) else {}
+        recent = sc.get("highestRecent") if isinstance(sc.get("highestRecent"), dict) else {}
+        out.append({"id": plain(_first(s.get("notation")), 40), "name": plain(_first(s.get("label")), 80),
+                    "river": plain(_first(s.get("riverName")), 80), "town": plain(_first(s.get("town")), 80),
+                    "lat": round(lat, 5), "lon": round(lon, 5), "measure": str(stage[0].get("@id") or ""),
+                    "unit": plain(stage[0].get("unitName"), 10), "high": _f0(sc.get("typicalRangeHigh")),
+                    "low": _f0(sc.get("typicalRangeLow")), "recent_high": _f0(recent.get("value"))})
+    return out
+
+
+def parse_river_readings(data):
+    """{measure id: (value, when)} for every level measure in England."""
+    out = {}
+    for r in json.loads(data.decode("utf-8")).get("items") or []:
+        if isinstance(r, dict) and isinstance(r.get("measure"), str):
+            v = _f0(r.get("value"))
+            if v is not None:
+                out[r["measure"]] = (v, r.get("dateTime") or "")
+    return out
+
+
+def river_state(st, v):
+    hi, lo = st.get("high"), st.get("low")
+    if hi is None:
+        return "unknown"
+    # A few stations measure from a different datum than their range: don't compare those.
+    if abs(v - hi) > max(10.0, 5 * abs(hi)):
+        return "unknown"
+    if st.get("recent_high") is not None and v >= st["recent_high"]:
+        return "very_high"
+    if v > hi:
+        return "high"
+    if lo is not None and v < lo:
+        return "low"
+    return "normal"
+
+
+RIVER_WORDS = {"very_high": "Higher than it's been for years", "high": "Above its normal range",
+               "normal": "Normal", "low": "Below its normal range", "unknown": "No usual range to compare"}
+
+
+def rivers_live(stations, levels, hist, home, now):
+    """Readings for the rivers near home, and warnings when one's above its normal range."""
+    t = time.time()
+    rows, items = [], []
+    for st in stations:
+        d = km_between(home["lat"], home["lon"], st["lat"], st["lon"])
+        lv = levels.get(st["measure"])
+        if d > RIVER_KM or not lv:
+            continue
+        v, when = lv
+        age = _iso_age_h(when, now)
+        if age is None or age > 48:
+            continue      # a gauge that's stopped reporting
+        h = [p for p in hist.get(st["id"], []) if t - p[0] < 48 * 3600 and p[1] is not None]
+        if not h or h[-1][0] < t - 300 or h[-1][1] != v:
+            h.append([t, v])
+        hist[st["id"]] = h[-200:]
+        before = [p for p in h if 2 * 3600 <= t - p[0] <= 6 * 3600]
+        trend = "steady"
+        if before:
+            change = v - before[-1][1]
+            trend = "rising" if change >= 0.05 else "falling" if change <= -0.05 else "steady"
+        state = river_state(st, v)
+        pct = None
+        if state != "unknown" and st.get("low") is not None and st["high"] > st["low"]:
+            pct = int(round(100.0 * (v - st["low"]) / (st["high"] - st["low"])))
+        place = st["river"] or st["name"]
+        where = "%s at %s" % (st["river"], st["name"]) if st["river"] else st["name"]
+        row = {"id": st["id"], "name": st["name"], "river": st["river"], "where": where, "km": round(d, 1),
+               "dir": DIR_SHORT.get(compass(home["lat"], home["lon"], st["lat"], st["lon"]), ""),
+               "level": round(v, 2), "unit": st["unit"], "high": st["high"], "low": st["low"], "pct": pct,
+               "state": state, "trend": trend, "when": when, "lat": st["lat"], "lon": st["lon"],
+               "url": "https://check-for-flooding.service.gov.uk/station/%s" % st["id"]}
+        rows.append(row)
+        if state in ("high", "very_high"):
+            sev = 2 if state == "very_high" else 1
+            items.append({"id": "river:%s:%s" % (st["id"], state), "source": "rivers", "kind": "river",
+                          "severity": sev, "level": "River high",
+                          "title": "%s: %s%s" % (where, RIVER_WORDS[state].lower(), ", and rising" if trend == "rising" else ""),
+                          "text": "The %s is at %s m, against a usual top of %s m. %s" % (
+                              place, fq(round(v, 2)), fq(st["high"]),
+                              "Keep an eye on flood warnings, and know how you'd get out if it rises further."),
+                          "area": st["town"] or st["name"], "distance_km": int(round(d)), "when": "",
+                          "url": row["url"], "issued": iso_utc(parse_when(when) or now)})
+    rows.sort(key=lambda r: r["km"])
+    order = {"very_high": 0, "high": 1}
+    top = sorted(rows, key=lambda r: (order.get(r["state"], 2), r["km"]))
+    return items, {"stations": rows[:6], "high": sum(1 for r in rows if r["state"] in order),
+                   "count": len(rows), "worst": top[0] if top else None}
+
+
+# -- Power cuts -----------------------------------------------------------------------------
+def _cut(dno, ref, lat, lon, customers, planned, etr, started, where):
+    return {"dno": dno, "ref": plain(ref, 40), "lat": lat, "lon": lon, "customers": int(customers or 0),
+            "planned": bool(planned), "etr": plain(etr, 30), "started": plain(started, 30), "where": plain(where, 80)}
+
+
+def parse_ukpn(data):
+    out = []
+    for r in json.loads(data.decode("utf-8")) or []:
+        if not isinstance(r, dict):
+            continue
+        kind = (r.get("powercuttype") or "").strip()
+        if kind not in ("Planned", "Unplanned") or r.get("statusid") == 5:
+            continue   # restored, or a roll-up of others
+        g = r.get("geopoint") if isinstance(r.get("geopoint"), dict) else {}
+        lat, lon = _f0(g.get("lat")), _f0(g.get("lon"))
+        if lat is None or lon is None:
+            continue
+        out.append(_cut("UK Power Networks", r.get("incidentreference"), lat, lon,
+                        r.get("nocustomeraffected") or r.get("noplannedcustomers"), kind == "Planned",
+                        r.get("estimatedrestorationdate") or r.get("incidenttypetbcestimatedfriendlydescription"),
+                        r.get("receiveddate") or r.get("planneddate"), r.get("postcodesaffected")))
+    return out
+
+
+def parse_nged(data, now):
+    out = []
+    for r in csv.DictReader(io.StringIO(data.decode("utf-8-sig", "replace"))):
+        status = (r.get("Status") or "").lower()
+        if "restor" in status or "complete" in status or (r.get("Resource Status") or "").upper() == "CANC":
+            continue
+        lat, lon = _f0(r.get("Location Latitude")), _f0(r.get("Location Longitude"))
+        if lat is None or lon is None:
+            continue
+        planned = (r.get("Planned") or "").lower() == "true"
+        age = _iso_age_h(r.get("Start Time"), now)
+        if planned and age is not None and age > 48:
+            continue   # an old planned job still listed
+        n = (_f0(r.get("Confirmed Off")) or 0) + (_f0(r.get("Predicted Off")) or 0)
+        out.append(_cut("National Grid", r.get("Incident ID"), lat, lon, n, planned, r.get("ETR"), r.get("Start Time"),
+                        (r.get("Postcodes") or "").split(",")[0]))
+    return out
+
+
+def parse_ssen(data):
+    out = []
+    for r in (json.loads(data.decode("utf-8")) or {}).get("faults") or []:
+        if not isinstance(r, dict):
+            continue
+        loc = r.get("location") if isinstance(r.get("location"), dict) else {}
+        lat, lon = _f0(loc.get("latitude")), _f0(loc.get("longitude"))
+        if lat is None or lon is None:
+            continue
+        areas = r.get("affectedAreas") if isinstance(r.get("affectedAreas"), list) else []
+        out.append(_cut("SSEN", r.get("reference"), lat, lon, r.get("customerCount"), r.get("type") == "PSI",
+                        r.get("estimatedRestorationTimeUtc"), r.get("loggedAtUtc"),
+                        r.get("title") or (areas[0] if areas else "")))
+    return out
+
+
+def parse_npg(data):
+    by = {}
+    for r in json.loads(data.decode("utf-8")) or []:
+        if not isinstance(r, dict) or not r.get("reference"):
+            continue
+        lat, lon = _f0(r.get("lat")), _f0(r.get("lng"))
+        if lat is None or lon is None or r["reference"] in by:
+            continue
+        pc = r.get("postcode") if isinstance(r.get("postcode"), list) else []
+        by[r["reference"]] = _cut("Northern Powergrid", r["reference"], lat, lon,
+                                  (_f0(r.get("totalconfirmedpowercut")) or 0) + (_f0(r.get("totalpredictedpowercut")) or 0),
+                                  "planned" in (r.get("natureofoutage") or "").lower(),
+                                  r.get("estimatedtimetillresolution"), r.get("loggedtime"),
+                                  re.sub(r"\s+", " ", pc[0]) if pc else "")
+    return list(by.values())
+
+
+POWER_FEEDS = (("power_ukpn", "ukpn"), ("power_nged", "nged"), ("power_ssen", "ssen"), ("power_npg", "npg"))
+
+
+def when_words(s):
+    """'2026-11-14T23:00:00' -> 'about 23:00' (today) or '15 Nov 03:30'."""
+    try:   # times with no zone (UK Power Networks, National Grid) are UK local time already
+        d = dt.datetime.fromisoformat((s or "").strip().replace("Z", "+00:00")[:25])
+    except ValueError:
+        return plain(s, 30)
+    local = d.astimezone().replace(tzinfo=None) if d.tzinfo else d
+    return local.strftime("%H:%M") if local.date() == dt.date.today() else "%d %s %s" % (
+        local.day, local.strftime("%b"), local.strftime("%H:%M"))
+
+
+def power_live(cuts, home):
+    rows, items = [], []
+    for c in cuts:
+        d = km_between(home["lat"], home["lon"], c["lat"], c["lon"])
+        if d > POWER_KM:
+            continue
+        c = dict(c, km=round(d, 1), dir=DIR_SHORT.get(compass(home["lat"], home["lon"], c["lat"], c["lon"]), ""))
+        c["text"] = "%s%s, %s %s%s" % ("Planned: " if c["planned"] else "", c["where"] or c["dno"], _km_words(d), c["dir"],
+                                       (" · back by " + when_words(c["etr"])) if c["etr"] and not c["planned"] else "")
+        rows.append(c)
+        if d <= POWER_NEAR_KM:
+            homes = ("%d homes" % c["customers"]) if c["customers"] > 1 else "a home" if c["customers"] == 1 else ""
+            if c["planned"]:
+                title = "Planned power cut %s away" % _km_words(d)
+                text = ("%s plans to switch the power off nearby%s. If it's your street, they'll have written to "
+                        "you. Charge phones and power banks before it starts." % (c["dno"], (" (" + homes + ")") if homes else ""))
+            else:
+                title = "Power cut %s away" % _km_words(d)
+                text = ("%s is working on a power cut %s %s%s%s. If your power's off, call 105 to report it or "
+                        "check for updates." % (c["dno"], _km_words(d), c["dir"], (", affecting " + homes) if homes else "",
+                                                (", and expects it back by " + when_words(c["etr"])) if c["etr"] else ""))
+            items.append({"id": "power:%s:%s" % (c["dno"], c["ref"]), "source": "power", "kind": "power",
+                          "severity": 1 if c["planned"] else 2, "level": "Planned" if c["planned"] else "Power cut",
+                          "title": title, "text": text, "area": c["where"], "distance_km": int(round(d)),
+                          "when": "", "url": "https://www.powercut105.com/", "issued": iso_utc(parse_when(c["started"]) or dt.datetime.now(dt.timezone.utc))})
+    rows.sort(key=lambda r: r["km"])
+    unplanned = [r for r in rows if not r["planned"]]
+    return items, {"cuts": rows[:6], "count": len(unplanned), "planned": len(rows) - len(unplanned),
+                   "homes": sum(r["customers"] for r in unplanned), "near": sum(1 for r in unplanned if r["km"] <= POWER_NEAR_KM)}
+
+
+# -- The electricity grid -----------------------------------------------------------------------
+GRID_PERIOD = re.compile(r"from\s+(\d{1,2})[:.]?(\d{2})\s*hrs?\s+(?:to|until)\s+(\d{1,2})[:.]?(\d{2})\s*hrs?\s+on\s+\w+\s+"
+                         r"(\d{1,2})/(\d{1,2})/(\d{4})", re.I)
+
+
+def grid_text(t):
+    return re.sub(r"[ \t]+", " ", (t or "").replace("\r\\n", "\n").replace("\\n", "\n").replace("\r", "")).strip()
+
+
+def parse_grid(data, now):
+    """NESO's notices that matter to households: electricity margin notices, capacity market notices, and
+    any warning of demand control (planned rota power cuts). Cancelled or finished ones drop out."""
+    rows = json.loads(data.decode("utf-8"))
+    rows = rows.get("data") if isinstance(rows, dict) else rows
+    notices = []
+    for r in sorted([r for r in rows or [] if isinstance(r, dict)], key=lambda r: r.get("publishTime") or ""):
+        kind = (r.get("warningType") or "").upper()
+        text = grid_text(r.get("warningText"))
+        up = text.upper()
+        when = parse_when(r.get("publishTime"))
+        if not when or when > now + dt.timedelta(minutes=5):
+            continue
+        if "TEST" in up or "FLEXIBIL" in up:
+            continue   # voltage reduction tests and the Demand Flexibility Service aren't warnings
+        if "DEMAND CONTROL IMMINENT" in up or "HIGH RISK OF DEMAND REDUCTION" in up:
+            key = "demand"
+        elif kind == "ELECTRICITY MARGIN NOTICE" or "ELECTRICITY MARGIN NOTICE" in up:
+            key = "emn"
+        elif kind == "CAPACITY MARKET NOTICE" or "CAPACITY MARKET NOTICE" in up:
+            key = "cmn"
+        else:
+            continue
+        if "CANCEL" in up:
+            notices = [n for n in notices if n["key"] != key]
+            continue
+        end = None
+        m = GRID_PERIOD.search(text)
+        if m:
+            try:
+                end = dt.datetime(int(m.group(7)), int(m.group(6)), int(m.group(5)), int(m.group(3)) % 24, int(m.group(4)))
+                start = end.replace(hour=int(m.group(1)) % 24, minute=int(m.group(2)))
+                if end <= start:
+                    end += dt.timedelta(days=1)
+            except ValueError:
+                end = None
+        notices.append({"key": key, "when": when, "end": end, "text": text, "period": m.group(0) if m else ""})
+    local_now = now.astimezone().replace(tzinfo=None)   # the periods are in UK time
+    items = []
+    for n in notices:
+        if (n["end"] and n["end"] < local_now) or (not n["end"] and now - n["when"] > dt.timedelta(hours=12)):
+            continue
+        if n["key"] == "demand":
+            sev, title = 2, "Electricity grid: warning of possible planned power cuts"
+            text = ("NESO, which runs Britain's electricity system, has warned that it may have to cut power to some "
+                    "areas in turn (demand control). Charge phones and power banks, and keep torches handy.")
+        elif n["key"] == "emn":
+            sev, title = 1, "Electricity margin notice: the grid is short of spare power"
+            text = ("NESO is asking power stations for more electricity %s. It's a call for more supply, not a power "
+                    "cut, and they're usually met. A good time to charge power banks." % (n["period"] or "for a few hours"))
+        else:
+            sev, title = 1, "Capacity market notice: the grid expects to be tight"
+            text = ("NESO expects less spare electricity than it likes in the next few hours. It's an early warning to "
+                    "power stations, not a power cut.")
+        items.append({"id": "grid:%s:%s" % (n["key"], iso_utc(n["when"])), "source": "grid", "kind": "grid",
+                      "severity": sev, "level": "Grid notice", "title": title, "text": text, "area": "Great Britain",
+                      "when": n["period"], "url": "https://bmrs.elexon.co.uk/system-warnings", "issued": iso_utc(n["when"])})
+    status = "demand" if any(i["severity"] == 2 for i in items) else "notice" if items else "normal"
+    return items, {"status": status, "notices": len(items),
+                   "text": {"normal": "Normal: no notices", "notice": items[0]["title"] if items else "",
+                            "demand": "Warning of possible planned power cuts"}[status]}
+
+
+# -- Gas storage --------------------------------------------------------------------------------
+GAS_ITEMS = {"stock level": "stock", "available capacity": "space", "inflows": "in", "outflows": "out"}
+
+
+def parse_gas(data):
+    """{date: {stock, space, in, out}} in GWh, from the National Gas data portal's CSV."""
+    days = {}
+    for r in csv.DictReader(io.StringIO(data.decode("utf-8-sig", "replace"))):
+        name = (r.get("Data Item") or "").lower()
+        key = next((v for k, v in GAS_ITEMS.items() if k in name), None)
+        v = _f0(r.get("Value"))
+        try:
+            d, m, y = (r.get("Applicable For") or "").split("/")
+            day = dt.date(int(y), int(m), int(d))
+        except ValueError:
+            continue
+        if key and v is not None:
+            days.setdefault(day, {})[key] = v / 1e6
+    return days
+
+
+def gas_stats(days):
+    """How full, and the net draw a day over the last two weeks (positive = emptying)."""
+    full = sorted(d for d, v in days.items() if "stock" in v and "space" in v)
+    if not full:
+        return None
+    last = full[-1]
+    stock, space = days[last]["stock"], days[last]["space"]
+    pct = 100.0 * stock / (stock + space) if stock + space > 0 else 0.0
+    back = [d for d in full if d <= last - dt.timedelta(days=14)]
+    draw = (days[back[-1]]["stock"] - stock) / float((last - back[-1]).days) if back else None
+    return {"day": last, "gwh": stock, "pct": pct, "draw": draw}
+
+
+def gas_live(now_days, year_ago_days, today):
+    s = gas_stats(now_days)
+    if not s:
+        raise ValueError("no storage figures in the feed")
+    ly = gas_stats(year_ago_days) if year_ago_days else None
+    items = []
+    reading = {"pct": round(s["pct"], 1), "gwh": int(round(s["gwh"])), "date": s["day"].isoformat(),
+               "draw_gwh_day": round(s["draw"], 1) if s["draw"] is not None else None,
+               "year_ago_pct": round(ly["pct"], 1) if ly else None,
+               "year_ago_draw": round(ly["draw"], 1) if ly and ly["draw"] is not None else None}
+    trend = "steady"
+    if s["draw"] is not None:
+        trend = "emptying" if s["draw"] > 5 else "filling" if s["draw"] < -5 else "steady"
+    reading["trend"] = trend
+    winter = today.month in (11, 12, 1, 2, 3)
+    if (s["draw"] is not None and ly and ly["draw"] is not None and s["draw"] > 20
+            and s["draw"] > 1.5 * max(ly["draw"], 5) and s["pct"] < ly["pct"]):
+        items.append({"id": "gas:faster:%s" % today.isoformat()[:7], "source": "gas", "kind": "gas", "severity": 1,
+                      "level": "Two-week trend", "title": "Gas storage is emptying faster than this time last year",
+                      "text": "Britain's gas storage is %d%% full, against %d%% a year ago, and over the last two weeks "
+                              "it's been drawn down by about %d GWh a day, against %d a year ago. Storage is a small "
+                              "part of Britain's gas supply, so it's a sign to watch rather than a worry on its own." % (
+                                  round(s["pct"]), round(ly["pct"]), round(s["draw"]), round(max(ly["draw"], 0))),
+                      "area": "Great Britain", "when": "", "url": "https://data.nationalgas.com/",
+                      "issued": iso_utc(dt.datetime.now(dt.timezone.utc))})
+    if winter and s["pct"] < 10:
+        items.append({"id": "gas:low:%s" % today.isoformat()[:7], "source": "gas", "kind": "gas", "severity": 1,
+                      "level": "Gas storage", "title": "Gas storage is low: %d%% full" % round(s["pct"]),
+                      "text": "Britain's gas storage is nearly empty for the time of year. If the gas network asks "
+                              "people to use less, keep the rooms you use warm and have blankets and warm clothes ready.",
+                      "area": "Great Britain", "when": "", "url": "https://data.nationalgas.com/",
+                      "issued": iso_utc(dt.datetime.now(dt.timezone.utc))})
+    return items, reading
+
+
+# -- Air quality ---------------------------------------------------------------------------------
+def parse_air_sites(data):
+    out = []
+    for it in parse_xml(data).iter("item"):
+        desc = it.findtext("description") or ""
+        loc = dms(desc)
+        m = re.search(r"index\s+(\d+)", desc, re.I)
+        if loc and m:
+            out.append({"name": plain(it.findtext("title"), 80), "lat": loc[0], "lon": loc[1], "index": int(m.group(1)),
+                        "when": it.findtext("pubDate") or ""})
+    return out
+
+
+def parse_air_forecast(data, home):
+    """The forecast for the nearest of Defra's forecast points: [(day, index), ...] from today."""
+    best, best_d = None, None
+    for it in parse_xml(data).iter("item"):
+        desc = it.findtext("description") or ""
+        loc = dms(desc)
+        if not loc:
+            continue
+        d = km_between(home["lat"], home["lon"], loc[0], loc[1])
+        if best_d is None or d < best_d:
+            best, best_d = (plain(it.findtext("title"), 80), desc), d
+    if not best or best_d > AIR_KM:
+        return None
+    days = [(day, int(n)) for day, n in re.findall(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*:\s*(\d+)", best[1])]
+    return {"place": best[0].title(), "km": round(best_d, 1), "days": days}
+
+
+def air_live(sites, forecast, home, now):
+    near = sorted(((km_between(home["lat"], home["lon"], s["lat"], s["lon"]), s) for s in sites), key=lambda x: x[0])
+    site = near[0] if near and near[0][0] <= AIR_KM else None
+    reading = {"site": site[1]["name"] if site else "", "km": round(site[0], 1) if site else None,
+               "index": site[1]["index"] if site else None, "band": daqi_band(site[1]["index"]) if site else "",
+               "forecast": []}
+    today_name = dt.date.today().strftime("%a")
+    if forecast:
+        days = forecast["days"]
+        start = next((i for i, (d, _) in enumerate(days) if d == today_name), 0)
+        reading["forecast"] = [{"day": d, "index": n, "band": daqi_band(n)} for d, n in days[start:start + 3]]
+        reading["forecast_place"] = forecast["place"]
+    items = []
+    worst = None
+    for label, n in ([("now", reading["index"])] if reading["index"] else []) + \
+            [((f["day"] if i else "today"), f["index"]) for i, f in enumerate(reading["forecast"][:2])]:
+        if n and n >= 7 and (worst is None or n > worst[1]):
+            worst = (label, n)
+    if worst:
+        when = "now" if worst[0] == "now" else "today" if worst[0] == "today" else "on " + dict(
+            Mon="Monday", Tue="Tuesday", Wed="Wednesday", Thu="Thursday", Fri="Friday", Sat="Saturday",
+            Sun="Sunday").get(worst[0], worst[0])
+        items.append({"id": "air:%s:%s" % (dt.date.today().isoformat(), daqi_band(worst[1])), "source": "air",
+                      "kind": "air", "severity": 2 if worst[1] >= 10 else 1, "level": daqi_band(worst[1]) + " pollution",
+                      "title": "%s air pollution %s (index %d)" % (daqi_band(worst[1]), when, worst[1]),
+                      "text": "Adults and children with lung problems, and adults with heart problems, should do less "
+                              "strenuous exercise outdoors, and anyone with asthma may need their inhaler more often. "
+                              "Keep windows closed on busy roads.",
+                      "area": reading["site"] or reading.get("forecast_place", ""), "when": "",
+                      "url": "https://uk-air.defra.gov.uk/forecasting/", "issued": iso_utc(now)})
+    return items, reading
+
+
+# -- Space weather ------------------------------------------------------------------------------
+def parse_space(data, now):
+    doc = json.loads(data.decode("utf-8"))
+
+    def g(k):
+        try:
+            return int((doc.get(k) or {}).get("G", {}).get("Scale") or 0)
+        except (TypeError, ValueError, AttributeError):
+            return 0
+    g_now, g_next = g("0"), max(g("1"), g("2"), g("3"))
+    reading = {"g_now": g_now, "g_next": g_next, "text": G_WORDS.get(g_now, "Storm"),
+               "next_text": G_WORDS.get(g_next, "Storm")}
+    items = []
+    worst = max(g_now, g_next)
+    if worst >= 4:
+        items.append({"id": "space:G%d:%s" % (worst, now.date().isoformat()), "source": "space", "kind": "space",
+                      "severity": 2 if worst >= 5 else 1, "level": "G%d" % worst,
+                      "title": "%s %s" % (G_WORDS[worst], "now" if g_now == worst else "forecast"),
+                      "text": "A severe solar storm can disrupt power grids, satellite navigation, radio and mobile "
+                              "signals for a while. It's rare, and the grid is designed for it. Charge power banks "
+                              "and torches, and have a battery or wind-up radio. You may see the northern lights.",
+                      "area": "Worldwide", "when": "", "url": "https://www.swpc.noaa.gov/",
+                      "issued": iso_utc(now)})
+    return items, reading
+
+
+# -- The pound and Bank Rate -------------------------------------------------------------------------
+def parse_pound(data):
+    rows = []
+    for r in csv.DictReader(io.StringIO(data.decode("utf-8-sig", "replace"))):
+        try:
+            day = dt.datetime.strptime((r.get("DATE") or "").strip(), "%d %b %Y").date()
+        except ValueError:
+            continue
+        rows.append({"day": day, "usd": _f0(r.get("XUDLUSS")), "eur": _f0(r.get("XUDLERS")), "rate": _f0(r.get("IUDBEDR"))})
+    return sorted(rows, key=lambda r: r["day"])
+
+
+def _pct(a, b):
+    return 100.0 * (a - b) / b if a is not None and b else None
+
+
+def pound_live(rows, now):
+    rows = [r for r in rows if r["usd"] or r["eur"]]
+    if not rows:
+        raise ValueError("no exchange rates in the feed")
+    last = rows[-1]
+    wk = [r for r in rows if r["day"] <= last["day"] - dt.timedelta(days=7)]
+    fn = [r for r in rows if r["day"] <= last["day"] - dt.timedelta(days=14)]
+    wk, fn = (wk[-1] if wk else None), (fn[-1] if fn else None)
+    rates = [r["rate"] for r in rows if r["rate"] is not None]
+    reading = {"usd": last["usd"], "eur": last["eur"], "rate": rates[-1] if rates else None, "date": last["day"].isoformat(),
+               "usd_week": round(_pct(last["usd"], wk["usd"]), 1) if wk and _pct(last["usd"], wk["usd"]) is not None else None,
+               "eur_week": round(_pct(last["eur"], wk["eur"]), 1) if wk and _pct(last["eur"], wk["eur"]) is not None else None,
+               "usd_fortnight": round(_pct(last["usd"], fn["usd"]), 1) if fn and _pct(last["usd"], fn["usd"]) is not None else None,
+               "eur_fortnight": round(_pct(last["eur"], fn["eur"]), 1) if fn and _pct(last["eur"], fn["eur"]) is not None else None}
+    items = []
+    for cur, name in (("usd", "dollar"), ("eur", "euro")):
+        w, f = reading[cur + "_week"], reading[cur + "_fortnight"]
+        if w is not None and w <= -3:
+            items.append({"id": "pound:week:%s:%s" % (cur, last["day"].isoformat()), "source": "pound", "kind": "money",
+                          "severity": 1, "level": "The pound",
+                          "title": "The pound has fallen %s%% against the %s in a week" % (fq(abs(w)), name),
+                          "text": "A sharp fall in the pound makes imported food and fuel dearer over the following "
+                                  "months. Nothing to do today, but it's a reason to keep the stores topped up.",
+                          "area": "UK", "when": "", "url": "https://www.bankofengland.co.uk/boeapps/database/",
+                          "issued": iso_utc(now)})
+            break
+        if f is not None and f <= -5:
+            items.append({"id": "pound:fortnight:%s:%s" % (cur, last["day"].isoformat()), "source": "pound",
+                          "kind": "money", "severity": 1, "level": "Two-week trend",
+                          "title": "The pound is down %s%% against the %s over two weeks" % (fq(abs(f)), name),
+                          "text": "A steady fall in the pound makes imported food and fuel dearer over the following "
+                                  "months. A reason to keep the stores topped up.", "area": "UK", "when": "",
+                          "url": "https://www.bankofengland.co.uk/boeapps/database/", "issued": iso_utc(now)})
+            break
+    changed = [(a, b) for a, b in zip(rows, rows[1:]) if a["rate"] is not None and b["rate"] is not None
+               and a["rate"] != b["rate"] and b["day"] >= last["day"] - dt.timedelta(days=14)]
+    if changed:
+        a, b = changed[-1]
+        items.append({"id": "pound:rate:%s" % b["day"].isoformat(), "source": "pound", "kind": "news", "severity": 0,
+                      "level": "Bank Rate", "title": "Bank Rate %s to %s%% (from %s%%)" % (
+                          "up" if b["rate"] > a["rate"] else "down", fq(b["rate"]), fq(a["rate"])),
+                      "text": "", "area": "UK", "when": "", "url": "https://www.bankofengland.co.uk/monetary-policy",
+                      "issued": iso_utc(dt.datetime.combine(b["day"], dt.time(12), dt.timezone.utc))})
+    return items, reading
+
+
+LIVE_LOOK = {"rivers": ("🏞️", "Rivers"), "power": ("🔌", "Power cuts"), "grid": ("⚡", "The grid"),
+             "gas": ("🔥", "Gas storage"), "air": ("🌫️", "Air quality"), "space": ("☀️", "Space weather"),
+             "pound": ("💷", "The pound")}
+TREND_WORDS = {"rising": "rising", "falling": "falling", "steady": "steady"}
+
+
+def _signed(x):
+    return ("+" if x > 0 else "−" if x < 0 else "") + fq(abs(x))
+
+
+def live_rows(live, items):
+    """One line for each live source that's on: what it says now, and whether that's fine (good), worth
+    watching (warn) or serious (bad). The app, the Home Assistant sensor and the dashboard all use these."""
+    worst = {}
+    for i in items:
+        worst[i["source"]] = max(worst.get(i["source"], 0), i.get("severity") or 0)
+    rows = []
+    for key in LIVE_KEYS:
+        r = live.get(key)
+        if not r:
+            continue
+        emoji, name = LIVE_LOOK[key]
+        text, state = "", "good"
+        if key == "rivers":
+            w = r.get("worst")
+            if not w:
+                text = "No river gauges within %d km" % RIVER_KM
+            else:
+                text = "%s: %s, %s" % (w["where"], RIVER_WORDS[w["state"]].lower(), TREND_WORDS.get(w["trend"], w["trend"]))
+                if r.get("count", 0) > 1:
+                    text += " · %d gauges nearby" % r["count"]
+        elif key == "power":
+            if r["count"]:
+                c = [x for x in r["cuts"] if not x["planned"]][0] if any(not x["planned"] for x in r["cuts"]) else None
+                text = "%d power cut%s within %d km%s" % (r["count"], "" if r["count"] == 1 else "s", POWER_KM,
+                                                          (", nearest %s %s" % (_km_words(c["km"]), c["dir"])) if c else "")
+                state = "warn"
+            else:
+                text = "None within %d km" % POWER_KM
+            if r.get("planned"):
+                text += " · %d planned" % r["planned"]
+        elif key == "grid":
+            text = r["text"]
+            state = {"normal": "good", "notice": "warn", "demand": "bad"}.get(r["status"], "good")
+        elif key == "gas":
+            text = "%s%% full" % fq(round(r["pct"])) + ({"emptying": ", emptying", "filling": ", filling"}.get(r.get("trend"), ""))
+            if r.get("year_ago_pct") is not None:
+                text += " · %s%% a year ago" % fq(round(r["year_ago_pct"]))
+        elif key == "air":
+            if r.get("index"):
+                text = "%s (%d) at %s" % (r["band"], r["index"], r["site"])
+                state = "good" if r["index"] <= 6 else "bad" if r["index"] >= 10 else "warn"
+            else:
+                text = "No monitoring site within %d km" % AIR_KM
+            if len(r.get("forecast") or []) > 1:
+                f = r["forecast"][1]
+                text += " · %s: %s" % (f["day"], f["band"].lower())
+        elif key == "space":
+            nxt = G_WORDS.get(r["g_next"], "Storm")
+            text = r["text"] + ("" if r["g_next"] <= r["g_now"] else " · %s forecast" % (nxt[:1].lower() + nxt[1:]))
+        elif key == "pound":
+            bits = []
+            if r.get("usd"):
+                bits.append("$%.2f" % r["usd"])
+            if r.get("eur"):
+                bits.append("€%.2f" % r["eur"])
+            if r.get("rate") is not None:
+                bits.append("Bank Rate %s%%" % fq(r["rate"]))
+            text = " · ".join(bits)
+            if r.get("usd_week") is not None and abs(r["usd_week"]) >= 1:
+                text += " · %s%% on the dollar this week" % _signed(r["usd_week"])
+        if worst.get(key, 0) >= 2:
+            state = "bad"
+        elif worst.get(key, 0) == 1 and state == "good":
+            state = "warn"
+        rows.append({"key": key, "emoji": emoji, "name": name, "text": text, "state": state,
+                     "dot": {"good": "🟢", "warn": "🟡", "bad": "🔴"}[state], "checked_at": r.get("checked_at"),
+                     "credit": r.get("credit", "")})
+    return rows
+
+
+def fetch_live(key, cfg, home, mem, now):
+    """(warnings, reading) for one live source."""
+    if key == "space":
+        return parse_space(http_get(FEED_URLS["space"]), now)
+    if key == "grid":
+        start = (now - dt.timedelta(hours=36)).strftime("%Y-%m-%dT%H:%MZ")
+        end = (now + dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%MZ")
+        return parse_grid(http_get(FEED_URLS["grid"].format(start=start, end=end)), now)
+    if key == "gas":
+        today = now.date()
+        url = FEED_URLS["gas"]
+        this = parse_gas(http_get(url.format(start=(today - dt.timedelta(days=20)).isoformat(), end=today.isoformat())))
+        try:
+            ly = today.replace(year=today.year - 1)
+        except ValueError:
+            ly = today - dt.timedelta(days=365)
+        last = parse_gas(http_get(url.format(start=(ly - dt.timedelta(days=20)).isoformat(), end=ly.isoformat())))
+        return gas_live(this, last, today)
+    if key == "pound":
+        start = (now.date() - dt.timedelta(days=40)).strftime("%d/%b/%Y")
+        return pound_live(parse_pound(http_get(FEED_URLS["pound"].format(start=start))), now)
+    if not home:
+        raise NeedLocation()
+    if key == "rivers":
+        cache = mem["river_stations"]
+        spot = [round(home["lat"], 2), round(home["lon"], 2)]
+        old = (time.time() - (cache.get("t") or 0)) > 7 * 86400
+        if old or cache.get("home") != spot or not isinstance(cache.get("stations"), list):
+            st = parse_river_stations(http_get(FEED_URLS["river_stations"], timeout=60), home)
+            cache.clear()
+            cache.update({"t": time.time(), "home": spot, "stations": st})
+        return rivers_live(cache["stations"], parse_river_readings(http_get(FEED_URLS["rivers"], timeout=40)),
+                           mem["river_history"], home, now)
+    if key == "power":
+        cuts, worked, err = [], 0, None
+        for url_key, kind in POWER_FEEDS:
+            if not FEED_URLS.get(url_key):
+                continue
+            try:
+                data = http_get(FEED_URLS[url_key], timeout=30)
+                cuts += {"ukpn": parse_ukpn, "ssen": parse_ssen, "npg": parse_npg}[kind](data) if kind != "nged" \
+                    else parse_nged(data, now)
+                worked += 1
+            except Exception as e:   # one network's feed being down shouldn't hide the others
+                err = e
+        if not worked and err:
+            raise err
+        return power_live(cuts, home)
+    if key == "air":
+        sites = parse_air_sites(http_get(FEED_URLS["air"]))
+        fc = mem["air_forecast"]
+        if time.time() - (fc.get("t") or 0) > 6 * 3600 or fc.get("home") != [round(home["lat"], 2), round(home["lon"], 2)]:
+            try:
+                got = parse_air_forecast(http_get(FEED_URLS["air_forecast"], timeout=40), home)
+                fc.clear()
+                fc.update({"t": time.time(), "home": [round(home["lat"], 2), round(home["lon"], 2)], "fc": got})
+            except Exception:
+                pass   # the current readings are still worth having
+        return air_live(sites, fc.get("fc"), home, now)
+    raise ValueError("unknown source")
+
+
 def fetch_source(key, cfg, home, region, mem, now):
+    if key in LIVE_KEYS:
+        items, reading = fetch_live(key, cfg, home, mem, now)
+        mem["live"][key] = dict(reading, checked_at=now_iso(), credit=LIVE_CREDIT[key])
+        return items
     if key == "metoffice":
         return parse_met(http_get(FEED_URLS["metoffice"]), "" if region == "UK" else MET_NAME.get(region, ""))
     if key == "govalerts":
@@ -4145,6 +5575,11 @@ def fetch_source(key, cfg, home, region, mem, now):
     return out
 
 
+def home_key(home):
+    """Roughly where home is (about 1 km), so a reading for the old home isn't shown for a new one."""
+    return [round(home["lat"], 2), round(home["lon"], 2)] if home else None
+
+
 def why_failed(e):
     if isinstance(e, urllib.error.HTTPError):
         return "the site answered %s" % e.code
@@ -4161,7 +5596,8 @@ def warnings_run():
     with LOCK:
         cfg = warn_cfg()
         mem = {"areas": setting_raw("flood_areas", {}) or {}, "fire_cells": setting_raw("fire_cells", {}) or {},
-               "fire_ignore": fire_ignore_list()}
+               "fire_ignore": fire_ignore_list(), "river_stations": setting_raw("river_stations", {}) or {},
+               "river_history": setting_raw("river_history", {}) or {}, "air_forecast": setting_raw("air_forecast", {}) or {}}
     if not cfg["on"]:
         return
     home = home_location(cfg)
@@ -4173,18 +5609,28 @@ def warnings_run():
     for it in prev["items"] + prev["news"]:
         by_src.setdefault(it["source"], []).append(it)
     statuses, any_ok = {}, False
+    mem["live"] = live = dict(prev.get("live") or {})
     for key, _, _ in WARN_SOURCES:
         if not cfg["sources"][key]:
             by_src.pop(key, None)
+            live.pop(key, None)
             continue
         old = prev["sources"].get(key) or {}
+        # Live feeds change slowly (gas storage once a day): don't fetch them more often than that.
+        if key in LIVE_EVERY and old.get("ok") and key in live and time.time() - (old.get("t") or 0) < LIVE_EVERY[key] \
+                and (old.get("home") == home_key(home)):
+            statuses[key] = old
+            any_ok = True
+            continue
         try:
             got = fetch_source(key, cfg, home, region, mem, now)
             by_src[key] = got
-            statuses[key] = {"ok": True, "error": "", "checked_at": now_iso(), "count": len(got)}
+            statuses[key] = {"ok": True, "error": "", "checked_at": now_iso(), "count": len(got), "t": time.time(),
+                             "home": home_key(home)}
             any_ok = True
         except NeedLocation:
             by_src[key] = []
+            live.pop(key, None)
             statuses[key] = {"ok": False, "error": "Needs your location: set it in the warnings settings",
                              "checked_at": None, "count": 0}
         except Exception as e:
@@ -4204,7 +5650,8 @@ def warnings_run():
     seen = {k: v for k, v in seen.items() if v >= day_ago}
     seen.update((w["id"], now_iso()) for w in warnings)
     state = {"items": warnings, "news": [i for i in every if i["kind"] == "news"], "sources": statuses,
-             "checked_at": now_iso() if any_ok else prev["checked_at"], "region": region, "seen": seen}
+             "checked_at": now_iso() if any_ok else prev["checked_at"], "region": region, "seen": seen,
+             "live": live}
     areas = mem["areas"]
     if len(areas) > 3000:
         areas = dict(list(areas.items())[-2000:])
@@ -4212,6 +5659,9 @@ def warnings_run():
         set_setting_raw(db, "warnings_cache", state)
         set_setting_raw(db, "flood_areas", areas)
         set_setting_raw(db, "fire_cells", mem["fire_cells"])
+        set_setting_raw(db, "river_stations", mem["river_stations"])
+        set_setting_raw(db, "river_history", mem["river_history"])
+        set_setting_raw(db, "air_forecast", mem["air_forecast"])
     with WARN_LOCK:
         WARN_STATE.clear()
         WARN_STATE.update(state)
@@ -4271,7 +5721,9 @@ def warn_public():
     with WARN_LOCK:
         st = json.loads(json.dumps(WARN_STATE))
     on = cfg["on"]
-    return {"config": cfg, "on": on, "items": st["items"] if on else [], "news": st["news"] if on else [],
+    live = dict((k, v) for k, v in (st.get("live") or {}).items() if on and cfg["sources"].get(k))
+    return {"config": cfg, "on": on, "live": live, "live_rows": live_rows(live, st["items"] if on else []),
+            "items": st["items"] if on else [], "news": st["news"] if on else [],
             "sources": st["sources"] if on else {}, "checked_at": st["checked_at"] if on else None,
             "location": loc, "region": cfg["region"] or guess_region(loc) or "UK", "region_guessed": not cfg["region"],
             "regions": [[c, n] for c, n, _, _ in MET_REGIONS], "source_list": [[k, n] for k, n, _ in WARN_SOURCES],
@@ -4289,7 +5741,8 @@ def warn_brief():
             "highest": {0: "", 1: "yellow", 2: "amber", 3: "red"}[top], "max_severity": top,
             "serious": sum(1 for i in w["items"] if i["severity"] >= 2),
             "news": [{k: i.get(k) for k in ("title", "source", "url", "issued")} for i in w["news"]],
-            "checked_at": w["checked_at"]}
+            "checked_at": w["checked_at"],
+            "live": [{k: r[k] for k in ("key", "emoji", "name", "text", "state", "dot")} for r in w["live_rows"]]}
 
 
 @route("PUT", "/api/warnings")
@@ -4522,6 +5975,26 @@ GUIDE = {
     ],
     "leak": [
         say(GOV, "Be Ready", "Turn the water off at the stopcock, and keep away from any electrics near the water."),
+    ],
+    "power_cut_near": [
+        say(NETWORKS, "105", "There's a power cut nearby. To check whether it's yours, or report one, call 105. It's "
+                             "free from any phone."),
+        say(TIP, "", "Charge phones and power banks now, in case it spreads, and find the torches."),
+    ],
+    "river_high": [
+        say(GOV, "Environment Agency", "Check the flood warnings for your area, and sign up for free flood warnings "
+                                       "by phone, text or email at gov.uk/sign-up-for-flood-warnings."),
+        say(GOV, "Environment Agency", "If flooding is expected, move people, pets and valuables upstairs, and know "
+                                       "how to turn off the gas, electricity and water."),
+    ],
+    "grid_demand": [
+        say(NETWORKS, "Demand control", "If there are rota power cuts, your network operator will publish which areas "
+                                        "are off and when. Charge things, and fill flasks, before your slot."),
+        say(TIP, "", "Keep the fridge and freezer shut while the power's off, and use torches, not candles."),
+    ],
+    "space_storm": [
+        say(TIP, "", "A severe solar storm can upset satellite navigation, radio and mobile signals, and sometimes "
+                     "power. Charge power banks, keep a battery radio handy, and have a paper map."),
     ],
     "power_cut": [
         say(NETWORKS, "105", "To report or check a power cut, call 105. It's free from any phone."),
@@ -4764,6 +6237,17 @@ def assess(s, home):
         elif src == "fires":
             near = (w.get("distance_km") if w.get("distance_km") is not None else 99) <= 3
             add(3 if near else 2, "fire_near", title)
+        # Live information (1.12.0). Gas storage and the pound are worth knowing, but don't change the level.
+        elif src == "power" and sev >= 2:
+            add(2, "power_cut_near", title)
+        elif src == "rivers":
+            add(3 if sev >= 2 else 2, "river_high", title)
+        elif src == "grid" and sev >= 2:
+            add(2, "grid_demand", title)
+        elif src == "air":
+            add(2, "poor_air", title)
+        elif src == "space":
+            add(2, "space_storm", title)
 
     # Home sensors.
     r = home.get("readings") or {}
@@ -5086,7 +6570,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             raise ApiError(405 if path_matched else 404, "Not found" if not path_matched else "Method not allowed")
         except ApiError as e:
-            self.send_json(e.status, {"error": e.message})
+            self.send_json(e.status, dict({"error": e.message}, **({"code": e.code} if e.code else {})))
         except (BrokenPipeError, ConnectionResetError):
             raise
         except Exception:
@@ -5125,6 +6609,7 @@ def main():
     init_db()
     load_warnings()
     threading.Thread(target=backup_loop, name="backups", daemon=True).start()
+    threading.Thread(target=history_loop, name="history", daemon=True).start()
     threading.Thread(target=warnings_loop, name="warnings", daemon=True).start()
     if HA_TOKEN:
         threading.Thread(target=home_sensors_loop, name="home-sensors", daemon=True).start()
