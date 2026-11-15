@@ -15,7 +15,7 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 |---|---|---|
 | `sensor.dads_army_readiness` | How close you are to your readiness target, in %. 100% means you could hold out for the full target. | `hold_out_days`, `target_days`, `target_met` |
 | `sensor.dads_army_hold_out` | Days you could hold out (the lower of food and water) | `food_days`, `water_days`, `runs_out_first`, `target_days`, `target_met`, `people` |
-| `sensor.dads_army_food_days` | Days of food | |
+| `sensor.dads_army_food_days` | Days of food, eating whatever goes off first | `goes_off_first_days` |
 | `sensor.dads_army_water_days` | Days of water | |
 | `sensor.dads_army_kit_stocked` | Kit and supplies against their targets, in % | |
 | `sensor.dads_army_out_of_stock` | Items with a target but none in stock that's still in date | `items` (each has `name`, `get`, `unit` and `text`), `total` |
@@ -415,6 +415,7 @@ Dads Army records one line a day from 1.11.0, and keeps five years. When it firs
 - **A barcode you've scanned before** goes straight to its item. Choose **Putting it in the stores** or **Taking it out to use**.
 - **A new barcode** is looked up in Open Food Facts, a free database of food products. Only the barcode is sent. You get the name (in English), the size and the calories. **Add as a new item**, or tap something you already keep: another brand of baked beans can go on the same line, with its own batches. The barcode is remembered either way.
 - **No barcode, or Open Food Facts doesn't know it?** Tap **Read the label**. An AI reads the name, size, calories and best before date from a photo of the pack, for you to check before adding.
+- **Known, but no calories?** Tap **📷 Read the nutrition label** and photograph the nutrition table. The AI reads the kcal per 100 g and the weight, and works out the calories for the whole pack ("78 kcal per 100 g × 415 g = 324 kcal"). The same button is next to the calories when you add or edit something.
 - **Nothing to scan at all** (a single can from a multipack)? **Choose from your stores** lets you pick the item, then put one in or take one out.
 
 The reader knows the usual shop barcodes (EAN and UPC), plus GS1 DataBar (the wide, stretched ones on some own-brand packs), Code 128 and ITF.
@@ -424,6 +425,8 @@ The reader knows the usual shop barcodes (EAN and UPC), plus GS1 DataBar (the wi
 **Taking one out.** If you have more than one batch, **Use** asks which it's from (the oldest is ticked). **📷 Match the date on it** reads the date from a photo and ticks that batch.
 
 **Part of a pack.** In an item's details, **Each one holds** says what one holds: a 500 g bag, or 6 for a 6-pack. Then **Use** lets you say **an amount** (200 g, or 1 can) or **What's left** in the open one, and the item shows "1 bag + 300 g in the open one". **Once opened, use within** says how long it keeps once opened (an open tin of beans: about 3 days in the fridge). Using part of one makes the rest its own batch, marked as opened, which goes off then and is used first.
+
+**Calories and how long the food lasts.** Calories are for **one whole unit as you count it**: the whole tin, the whole bag, the whole 6-pack, never a serving. Dads Army adds up the calories in date, then eats them in date order, a day at a time, against what the household needs a day (HQ → Household). Food that would go off before you got to it doesn't count, and the Sitrep says how much that is. **Drinks** (juice, milk, squash) count as food, not as drinking water. Things with no calories set don't count at all: **Fill in missing details** in **HQ → Scanning** has the AI estimate them from their names, for you to check, marked **AI estimate** until you change them.
 
 **Which AI reads the photos.** In **HQ → Scanning**:
 

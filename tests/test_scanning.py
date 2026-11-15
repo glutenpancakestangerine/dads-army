@@ -1,4 +1,4 @@
-"""Scanning (1.13.0): barcodes, what Open Food Facts and the AI give back, pack sizes, using part of one,
+"""Scanning (1.13.0): how long the food lasts, barcodes, what Open Food Facts and the AI give back, pack sizes, using part of one,
 opened packs, and the AI settings. Nothing here reaches the internet or a real AI."""
 import json
 
@@ -120,6 +120,65 @@ class TestPacks(AppTest):
         server.api_use({"qty": 3, "batch_id": later}, {}, str(soup))   # more than the batch: the rest from the oldest
         self.assertEqual([(b["expiry"], b["qty"]) for b in self.item(soup)["batches"]], [(days_from_today(100), 1)])
         self.assertApiError(404, server.api_use, {"qty": 1, "batch_id": later}, {}, str(soup))
+
+
+class TestFoodDays(AppTest):
+    def test_food_that_goes_off_first_does_not_count(self):
+        server.api_settings({"adults": 2, "children": 0, "kcal_adult": 2200}, {})
+        # 4,400 kcal a day. 10 days of bread that goes off in 2 days (today, tomorrow and the day after),
+        # and 5 days of tins with no date: 3 + 5 days, with 7 days of bread wasted.
+        self.add("Bread", 10, days_from_today(2), category="food", unit="loaf", kcal_per_unit=4400)
+        self.add("Tins", 5, category="food", unit="tin", kcal_per_unit=4400)
+        s = server.summary()
+        self.assertEqual((s["food_days"], s["food_wasted_days"]), (8, 7))
+        # Drinks count as food (calories), not as drinking water.
+        self.add("Orange juice", 10, category="drinks", unit="carton", kcal_per_unit=440)
+        self.assertEqual(server.summary()["food_days"], 9)
+
+    def test_eating_what_goes_off_first(self):
+        import datetime as dt
+        t = dt.date(2027, 1, 1)
+        d = lambda n: (t + dt.timedelta(days=n)).isoformat()
+        self.assertEqual(server.lasts_days([(10, None)], 2, t), (5.0, 0.0))
+        self.assertEqual(server.lasts_days([(4, None), (6, d(2))], 1, t), (7.0, 3.0))
+        self.assertEqual(server.lasts_days([(5, d(-1))], 1, t), (0.0, 5.0))
+        self.assertEqual(server.lasts_days([(3, d(1)), (3, d(3))], 1, t), (4.0, 2.0))
+
+    def test_multipacks_count_the_whole_pack(self):
+        self.assertEqual(server.multipack_total("6 x 330 ml"), (6, 1980.0))
+        self.assertIsNone(server.multipack_total("415 g"))
+        p = server.product_from("5000000000001", {"product_name_en": "Orange juice", "quantity": "6 x 200 ml",
+                                                   "product_quantity": "200", "product_quantity_unit": "ml",
+                                                   "nutriments": {"energy-kcal_100g": 45}, "categories_tags": ["en:juices"]})
+        self.assertEqual((p["kcal_per_unit"], p["count"], p["category"], p["unit"]), (540, 6, "drinks", "pack"))
+        lab = server.parse_label_reply('{"name": "Cola", "size": "6 x 330 ml", "grams": 330, "kcal_100g": 42, "count": 6, '
+                                       '"category": "drinks", "unit": "pack"}')
+        self.assertEqual(lab["kcal_per_unit"], round(42 * 1980 / 100.0))
+
+    def test_nutrition_label(self):
+        r = server.parse_nutrition_reply('{"kcal_100g": 78, "grams": 415, "kcal_serving": 160, "serving_g": 207}')
+        self.assertEqual((r["kcal_per_unit"], r["how"]), (324, "78 kcal per 100 g × 415 g = 324 kcal"))
+        self.assertEqual(server.parse_nutrition_reply('{"kcal_100g": 120, "grams": null}', grams=400)["kcal_per_unit"], 480)
+        self.assertEqual(server.parse_nutrition_reply('{"kcal_100g": null, "kcal_pack": 1010}')["kcal_per_unit"], 1010)
+        r = server.parse_nutrition_reply('{"kcal_100g": 45}')   # no weight anywhere: says so rather than guessing
+        self.assertIsNone(r["kcal_per_unit"])
+        self.assertIsNone(server.parse_nutrition_reply("I can't see a label"))
+        self.assertApiError(400, server.api_scan_nutrition, {"image": "/9j/4AAQSkZJRgABAQ=="}, {})   # no AI here
+
+    def test_fill_in_is_checked_then_marked_until_changed(self):
+        asked = {1: ["kcal_per_unit", "pack_size", "open_days"], 2: ["kcal_per_unit"]}
+        got = server.parse_fill_reply('[{"id": 1, "kcal_per_unit": 320.4, "pack_size": 400, "pack_unit": "g", "open_days": 3}, '
+                                      '{"id": 2, "kcal_per_unit": "lots"}, {"id": 3, "kcal_per_unit": 100}]', asked)
+        self.assertEqual(got, {1: {"kcal_per_unit": 320, "pack_size": 400, "pack_unit": "g", "open_days": 3}})
+        rice = self.add("Rice (1kg)", 1, category="food", unit="bag")
+        server.api_ai_fill_apply({"items": [{"id": rice, "kcal_per_unit": 3600, "open_days": 365}]}, {})
+        it = self.item(rice)
+        self.assertEqual((it["kcal_per_unit"], it["open_days"], it["ai_guessed"]), (3600, 365, "kcal_per_unit,open_days"))
+        server.api_item_update({"kcal_per_unit": 3600, "open_days": 365}, {}, str(rice))   # saved unchanged: still marked
+        self.assertEqual(self.item(rice)["ai_guessed"], "kcal_per_unit,open_days")
+        server.api_item_update({"kcal_per_unit": 3500}, {}, str(rice))                     # changed by hand: not a guess
+        self.assertEqual(self.item(rice)["ai_guessed"], "open_days")
+        self.assertApiError(400, server.api_ai_fill_apply, {"items": []}, {})
 
 
 class TestAI(AppTest):

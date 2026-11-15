@@ -62,7 +62,7 @@ PORT = int(os.environ.get("DADSARMY_PORT", "8080"))
 KEEP_BACKUPS = max(1, int(os.environ.get("DADSARMY_KEEP_BACKUPS", "14")))
 MAX_BODY = 20 * 1024 * 1024
 
-CATEGORIES = ["food", "water", "medical", "power", "cooking", "hygiene",
+CATEGORIES = ["food", "water", "drinks", "medical", "power", "cooking", "hygiene",
               "tools", "comms", "shelter", "docs", "pets", "other"]
 
 DEFAULT_SETTINGS = {
@@ -228,7 +228,10 @@ ITEM_UPGRADES = [("per_day", "REAL NOT NULL DEFAULT 0"), ("price", "REAL NOT NUL
                  # 1.11.0: a change counter, so an undo can't overwrite a newer change made on another phone;
                  # and, for things from the starter list, which one (so targets can follow the household).
                  ("rev", "INTEGER NOT NULL DEFAULT 0"), ("starter", "TEXT NOT NULL DEFAULT ''"),
-                 ("auto_target", "INTEGER NOT NULL DEFAULT 0")]
+                 ("auto_target", "INTEGER NOT NULL DEFAULT 0"),
+                 # 1.13.0: fields the AI estimated ("kcal_per_unit,open_days"), until you change them
+                 ("ai_guessed", "TEXT NOT NULL DEFAULT ''")]
+KCAL_CATS = ("food", "drinks")   # what feeds the household: juice and milk count as food, not drinking water
 ITEM_FIELDS = ("name", "category", "unit", "kcal_per_unit", "litres_per_unit", "target_qty", "per_day", "price",
                "notes", "pack_size", "pack_unit", "open_days")
 ITEM_DEFAULTS = {"pack_size": 0, "pack_unit": "", "open_days": 0}
@@ -775,6 +778,30 @@ def check_status(c, today):
     return due, days, "Due in %s" % span(days)
 
 
+def lasts_days(lots, per_day, today):
+    """How many days stock lasts, eating whatever goes off first, and how much (in days' worth) goes off before
+    it can be eaten. lots: [(amount, expiry ISO date or None)], amounts in the same units as per_day.
+    Each day's share comes from the batch that goes off soonest; a batch can be eaten up to and including its
+    date, and what's left of it then is wasted. (Eating soonest-first wastes the least.)"""
+    if per_day <= 0:
+        return 0.0, 0.0
+    t = wasted = 0.0
+    for amount, exp in sorted(lots, key=lambda x: (x[1] is None, x[1] or "")):
+        if amount <= 0:
+            continue
+        days = amount / per_day
+        if exp:
+            room = (dt.date.fromisoformat(exp[:10]) - today).days + 1 - t   # days left to eat it in
+            if room <= 0:
+                wasted += days
+                continue
+            if days > room:
+                wasted += days - room
+                days = room
+        t += days
+    return t, wasted
+
+
 def summary():
     """What matters at a glance: the same figures the Sitrep screen shows."""
     today = dt.date.today()
@@ -791,6 +818,7 @@ def summary():
     pet_water = pets_water(st)
     water_day = people * st["water_per_person"] + pet_water
     kcal = litres = 0.0
+    kcal_lots, litre_lots = [], []
     kit_n, kit_sum = 0, 0.0
     value = cost = 0.0
     priced = 0
@@ -802,7 +830,7 @@ def summary():
         target = it["target_qty"] or 0
         price = it.get("price") or 0
         per_day = it.get("per_day") or 0
-        food = cat == "food" and (it["kcal_per_unit"] or 0) > 0
+        food = cat in KCAL_CATS and (it["kcal_per_unit"] or 0) > 0
         water = cat == "water" and (it["litres_per_unit"] or 0) > 0
         dated = []
         in_date = 0.0
@@ -813,8 +841,10 @@ def summary():
                 in_date += b["qty"]
             if food and fresh:
                 kcal += b["qty"] * it["kcal_per_unit"]
+                kcal_lots.append((b["qty"] * it["kcal_per_unit"], b["expiry"]))
             if water and fresh:
                 litres += b["qty"] * it["litres_per_unit"]
+                litre_lots.append((b["qty"] * it["litres_per_unit"], b["expiry"]))
             if d is not None and b["qty"] > 0:
                 dated.append((d, b))
                 if d >= 0:
@@ -868,8 +898,9 @@ def summary():
                                     "expiry": b0["expiry"], "days": d0, "location": b0["location"] or "",
                                     "text": " · ".join(bits)}))
 
-    food_days = kcal / kcal_day if kcal_day > 0 else 0.0
-    water_days = litres / water_day if water_day > 0 else 0.0
+    # Eaten in date order, a day at a time: food that goes off before you'd get to it doesn't count.
+    food_days, food_waste = lasts_days(kcal_lots, kcal_day, today)
+    water_days, water_waste = lasts_days(litre_lots, water_day, today)
     hold = min(food_days, water_days)
     upcoming.sort(key=lambda x: (x[0], x[1]["name"].lower()))
     nxt = None
@@ -921,6 +952,9 @@ def summary():
         "hold_out_days": _days(hold),
         "food_days": _days(food_days),
         "water_days": _days(water_days),
+        # Days' worth that goes off before it can be eaten (or drunk), eating the soonest first.
+        "food_wasted_days": _days(food_waste),
+        "water_wasted_days": _days(water_waste),
         "runs_out_first": "food" if food_days < water_days else "water" if water_days < food_days else "",
         "kit_stocked_pct": _round(100.0 * kit_sum / kit_n) if kit_n else 0,
         "kit_items": kit_n,
@@ -1236,6 +1270,9 @@ def api_item_update(body, query, item_id):
         before = get_item(db, item_id)
         if "target_qty" in data and before["auto_target"] and abs(data["target_qty"] - before["target_qty"]) > 1e-9:
             data["auto_target"] = 0   # you've set your own target: it no longer follows the household
+        guessed = [g for g in (before["ai_guessed"] or "").split(",") if g]
+        if guessed:   # a value you've changed by hand isn't an estimate any more
+            data["ai_guessed"] = ",".join(g for g in guessed if g not in data or before[g] == data[g])
         cols = ", ".join("%s = ?" % k for k in data)
         db.execute("UPDATE items SET %s, updated_at = ?, rev = rev + 1 WHERE id = ?" % cols,
                    list(data.values()) + [now_iso(), item_id])
@@ -1587,7 +1624,8 @@ def month_spend(today=None):
     return {"calls": row[0], "ok": row[2] or 0, "cost_usd": round(row[1], 6), "since": start}
 
 
-AI_TASKS = (("Dads Army best before", "dates"), ("Dads Army label", "labels"))
+AI_TASKS = (("Dads Army best before", "dates"), ("Dads Army label", "labels"), ("Dads Army nutrition", "labels"),
+            ("Dads Army fill in", "filled"))
 
 
 def ai_stats(today=None):
@@ -1600,7 +1638,7 @@ def ai_stats(today=None):
         r = DB.execute("SELECT COUNT(*), IFNULL(SUM(cost_usd), 0), IFNULL(SUM(ok), 0) FROM ai_calls WHERE ts >= ? AND ts < ?",
                        (a, b)).fetchone()
         return {"calls": r[0], "ok": r[2], "cost_usd": round(r[1], 6)}
-    tasks = {"dates": 0, "labels": 0, "other": 0}
+    tasks = {"dates": 0, "labels": 0, "filled": 0, "other": 0}
     for r in DB.execute("SELECT task, COUNT(*) FROM ai_calls WHERE ts >= ? AND ok = 1 GROUP BY task", (m["since"],)):
         tasks[next((k for t, k in AI_TASKS if r[0] == t), "other")] += r[1]
     tok = DB.execute("SELECT IFNULL(SUM(tokens_in), 0), IFNULL(SUM(tokens_out), 0) FROM ai_calls WHERE ts >= ?", (m["since"],)).fetchone()
@@ -1628,9 +1666,11 @@ LABEL_PROMPT = (
     "This is a photo of a food, drink or household product, without a readable barcode. Read the packaging and "
     "reply with only a JSON object, in English (translate if the packaging isn't), with these keys: "
     '"name" (short product name with brand if shown, e.g. "Heinz Baked Beans"), "size" (pack size as printed, e.g. '
-    '"415 g", or null), "grams" (net weight in grams or volume in millilitres as a number, or null), '
+    '"415 g", or null), "grams" (net weight in grams or volume in millilitres of the WHOLE pack as a number, so '
+    '1980 for 6 x 330 ml, or null), '
     '"kcal_100g" (energy in kcal per 100 g or 100 ml as a number, or null), "count" (how many in a multipack, e.g. 6 '
-    'for 6 x 330 ml, or null), "category" (one of food, water, medical, power, cooking, hygiene, tools, comms, '
+    'for 6 x 330 ml, or null), "category" (one of food, water (plain drinking water only), drinks (juice, milk, '
+    'squash, fizzy drinks), medical, power, cooking, hygiene, tools, comms, '
     'shelter, docs, pets, other), "unit" (what you count it in: tin, pack, bottle, jar, box, bag, each), '
     '"best_before" (best before or use by date as YYYY-MM-DD, last day of the month if only month and year, or '
     "null). Use null for anything you can't read. No other text.")
@@ -1685,12 +1725,24 @@ def off_product(code):
     return out
 
 
+def multipack_total(text):
+    """'6 x 330 ml' -> (6, 1980.0): how many, and the whole pack in grams or millilitres. None if it isn't one."""
+    m = re.search(r"(\d{1,3})\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(kg|g|ml|cl|l)\b", str(text or ""), re.I)
+    if not m or int(m.group(1)) < 2:
+        return None
+    each = float(m.group(2).replace(",", ".")) * {"kg": 1000, "g": 1, "ml": 1, "cl": 10, "l": 1000}[m.group(3).lower()]
+    return int(m.group(1)), each * int(m.group(1))
+
+
+DRINK_TAGS = r"beverages|juices|sodas|soft-drinks|milks|smoothies|plant-based-milks"
+
+
 def product_from(code, p):
-    """An Open Food Facts product (the online JSON, or a row of the offline list) shaped for Dads Army."""
+    """An Open Food Facts product (online JSON, or a row of the offline list) shaped for Dads Army."""
     english = (p.get("product_name_en") or p.get("abbreviated_product_name_en") or p.get("generic_name_en") or "").strip()
     name = english or (p.get("product_name") or "").strip()
     if name and not english and str(p.get("lang") or "en") != "en":
-        name = translate_name(name) or name   # a German product, say: the AI gives the English
+        name = translate_name(name) or name   # e.g. a German product: ask the AI for the English
     brand = (p.get("brands") or "").split(",")[0].strip()
     qty_text = (p.get("quantity") or "").strip()
     grams = None
@@ -1699,21 +1751,29 @@ def product_from(code, p):
             grams = float(p["product_quantity"])
     except (TypeError, ValueError):
         grams = None
+    # A multipack ("6 x 330 ml"): calories and size are for the whole pack, as that's what's counted.
+    # Open Food Facts sometimes gives one can's weight; the printed quantity says what the pack holds.
+    multi = multipack_total(qty_text)
+    if multi and (not grams or grams < multi[1] * 0.9):
+        grams = multi[1]
     kcal100 = (p.get("nutriments") or {}).get("energy-kcal_100g")
     try:
         kcal = round(float(kcal100) * grams / 100.0) if kcal100 is not None and grams else 0
     except (TypeError, ValueError):
         kcal = 0
     tags = " ".join(p.get("categories_tags") or [])
-    drink = re.search(r"waters|bottled-water|mineral-water", tags)
     mcount = re.match(r"^\s*(\d{1,3})\s*[x×]\s*", qty_text, re.I)
     count = int(mcount.group(1)) if mcount and int(mcount.group(1)) > 1 else 0
+    drink = re.search(r"waters|bottled-water|mineral-water", tags)
+    juice = not drink and re.search(DRINK_TAGS, tags)
     full = (brand + " " if brand and brand.lower() not in name.lower() else "") + name
     out = {"code": code, "name": (full + (" (%s)" % qty_text if qty_text else "")).strip()[:120] or code,
-           "brand": brand, "quantity": qty_text, "grams": grams, "kcal_per_unit": kcal, "kcal_100g": kcal100,
-           "category": "water" if drink else "food", "count": count,
+           "brand": brand, "quantity": qty_text, "grams": grams, "kcal_per_unit": kcal,
+           "kcal_100g": kcal100, "category": "water" if drink else "drinks" if juice else "food", "count": count,
            "litres_per_unit": round(grams / 1000.0, 2) if drink and grams else 0,
-           "unit": "bottle" if drink else ("tin" if re.search(r"canned|tinned", tags) else "pack")}
+           "unit": "pack" if count else "bottle" if drink or juice else ("tin" if re.search(r"canned|tinned", tags) else "pack")}
+    if drink:
+        out["kcal_per_unit"] = 0
     return out
 
 
@@ -1909,12 +1969,15 @@ def parse_label_reply(text):
     grams, kcal100, count = number(d.get("grams")), number(d.get("kcal_100g")), number(d.get("count"))
     catg = d.get("category") if d.get("category") in CATEGORIES else "food"
     size = clean_text(d.get("size"), 30) if d.get("size") else ""
+    multi = multipack_total(size)
+    if multi and (not grams or grams < multi[1] * 0.9):
+        grams = multi[1]   # the whole pack, not one can
     name = clean_text(d.get("name"), 100)
     unit = clean_text(d.get("unit"), 20).lower() if d.get("unit") else ""
     return {"code": "", "count": int(count) if count and count > 1 and count == int(count) else 0,
             "name": (name + (" (%s)" % size if size and size.lower() not in name.lower() else "")).strip(),
             "brand": "", "quantity": size, "grams": grams, "kcal_100g": kcal100,
-            "kcal_per_unit": round(kcal100 * grams / 100.0) if catg == "food" and kcal100 and grams else 0,
+            "kcal_per_unit": round(kcal100 * grams / 100.0) if catg in KCAL_CATS + ("pets",) and kcal100 and grams else 0,
             "litres_per_unit": round(grams / 1000.0, 2) if catg == "water" and grams else 0,
             "category": catg, "unit": unit if re.fullmatch(r"[a-z]{2,12}", unit) else ("bottle" if catg == "water" else "pack"),
             "expiry": read_date_reply(d.get("best_before")) if d.get("best_before") else None, "from_ai": True}
@@ -2192,6 +2255,199 @@ def api_scan_date(body, query):
     """Read the best before date from a photo."""
     reply, ai = ai_ask(DATE_PROMPT, photo_from(body), "Dads Army best before")
     return {"date": read_date_reply(reply), "reply": str(reply or "")[:40], "ai": ai}
+
+
+# --------------------------------------------------------------------------
+# Filling in what's missing (1.13.0): calories for a whole pack, what one holds, and how long it keeps once
+# opened, estimated by the AI from the name, for you to check. Nothing is saved until you say so, and what
+# was estimated is marked until you change it.
+# --------------------------------------------------------------------------
+FILL_MAX = 40
+NO_KCAL_RE = re.compile(r"\b(tea|coffee|salt|stock|spice|herb|pepper|water|vinegar|yeast|baking)\b", re.I)
+
+
+def fill_wanted(it):
+    """The fields worth estimating for an item: [] if it has what it needs."""
+    cat = it["category"]
+    if cat not in KCAL_CATS + ("pets",):
+        return []
+    want = []
+    if not (it["kcal_per_unit"] or 0) > 0 and not NO_KCAL_RE.search(it["name"]):
+        want.append("kcal_per_unit")
+    if not (it["pack_size"] or 0) > 0:
+        want.append("pack_size")
+    if not (it["open_days"] or 0) > 0 and cat in KCAL_CATS:
+        want.append("open_days")
+    return want
+
+
+FILL_PROMPT = (
+    "These are items in a UK household's emergency food stores. For each one, estimate what's missing, from the "
+    "name and unit, using typical UK supermarket products. Reply with only a JSON array, one object per item, with "
+    '"id" and only the keys asked for: "kcal_per_unit" (energy in kcal for ONE WHOLE unit as counted, e.g. a whole '
+    "400 g tin of baked beans is about 320, a 1 kg bag of rice about 3600, a pack of 6 cans is all six), "
+    '"pack_size" and "pack_unit" (what one unit holds: pack_unit one of g, kg, ml, l, each; "each" with a count for '
+    'a multipack), "open_days" (days it keeps once opened, stored as the label says: an open tin about 3, an open '
+    "jar of jam about 30, dry pasta about 365). Use null if you can't tell. No other text.\n\n")
+
+
+def parse_fill_reply(text, asked):
+    """The AI's JSON array to {id: {field: value}}, keeping only fields asked for, with sane values."""
+    m = re.search(r"\[.*\]", str(text or ""), re.S)
+    try:
+        rows = json.loads(m.group(0)) if m else []
+    except ValueError:
+        rows = []
+    out = {}
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            iid = int(r.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if iid not in asked:
+            continue
+        got = {}
+        for f, lo, hi in (("kcal_per_unit", 1, 100000), ("pack_size", 0.01, 100000), ("open_days", 1, 3650)):
+            if f not in asked[iid]:
+                continue
+            try:
+                v = float(r.get(f))
+            except (TypeError, ValueError):
+                continue
+            if lo <= v <= hi:
+                got[f] = round(v) if f != "pack_size" else round(v, 2)
+        if "pack_size" in got:
+            u = str(r.get("pack_unit") or "").lower()
+            if u in PACK_UNITS:
+                got["pack_unit"] = u
+            else:
+                got.pop("pack_size")
+        if got:
+            out[iid] = got
+    return out
+
+
+@route("POST", "/api/ai/fill")
+def api_ai_fill(body, query):
+    """Estimates for what's missing, for you to check. Nothing is saved here."""
+    with LOCK:
+        items = [dict(r) for r in DB.execute("SELECT id, name, category, unit, kcal_per_unit, pack_size, pack_unit, "
+                                             "open_days FROM items ORDER BY name COLLATE NOCASE")]
+    only = body.get("ids")
+    if isinstance(only, list):
+        keep = set(as_int_id(i) for i in only[:FILL_MAX])
+        items = [it for it in items if it["id"] in keep]
+    asked = {}
+    lines = []
+    for it in items:
+        want = fill_wanted(it)
+        if want and len(asked) < FILL_MAX:
+            asked[it["id"]] = want
+            lines.append(json.dumps({"id": it["id"], "name": it["name"], "unit": it["unit"] or "", "category": it["category"],
+                                     "asked": [w for w in want], "known": {k: it[k] for k in ("pack_size", "pack_unit")
+                                                                          if it[k] and "pack_size" not in want}}))
+    if not asked:
+        return {"suggestions": [], "left": 0}
+    reply, _ai = ai_ask(FILL_PROMPT + "\n".join(lines), None, "Dads Army fill in")
+    got = parse_fill_reply(reply, asked)
+    names = dict((it["id"], it) for it in items)
+    left = sum(1 for it in items if fill_wanted(it)) - len(asked)
+    return {"suggestions": [{"id": i, "name": names[i]["name"], "unit": names[i]["unit"], "fields": f}
+                            for i, f in got.items()], "left": max(0, left)}
+
+
+@route("POST", "/api/ai/fill/apply")
+def api_ai_fill_apply(body, query):
+    """Save the estimates you kept, marked as estimated until you change them."""
+    rows = body.get("items")
+    if not isinstance(rows, list) or not rows or len(rows) > 200:
+        raise ApiError(400, "Nothing to save")
+    n = 0
+    with tx() as db:
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            iid = as_int_id(r.get("id"))
+            if not db.execute("SELECT 1 FROM items WHERE id = ?", (iid,)).fetchone():
+                continue
+            data = clean_item(dict((k, r[k]) for k in ("kcal_per_unit", "pack_size", "pack_unit", "open_days") if k in r),
+                              partial=True)
+            if not data:
+                continue
+            old = db.execute("SELECT ai_guessed FROM items WHERE id = ?", (iid,)).fetchone()["ai_guessed"]
+            guessed = sorted(set(filter(None, old.split(","))) | set(k for k in data if k != "pack_unit"))
+            cols = ", ".join("%s = ?" % k for k in data)
+            db.execute("UPDATE items SET %s, ai_guessed = ?, updated_at = ?, rev = rev + 1 WHERE id = ?" % cols,
+                       list(data.values()) + [",".join(guessed), now_iso(), iid])
+            n += 1
+        if n:
+            add_log("edited", "%d item%s" % (n, "" if n == 1 else "s"), "Details filled in by the AI")
+    return {"saved": n}
+
+
+# --------------------------------------------------------------------------
+# The nutrition panel (1.13.0): calories for the whole pack from a photo of the back, for something already in
+# Open Food Facts without calories, or already in the stores. Read from the label, so it's not an estimate.
+# --------------------------------------------------------------------------
+NUTRITION_PROMPT = (
+    "This is a photo of the nutrition information (and maybe the weight) on a food or drink pack. Reply with only "
+    "a JSON object with these keys: \"kcal_100g\" (energy in kcal per 100 g or per 100 ml as a number: use the "
+    "kcal figure, not kJ; if only kJ is printed, divide by 4.184), \"grams\" (net weight or volume of the WHOLE pack "
+    "in grams or millilitres, if printed anywhere in the photo, e.g. 1980 for 6 x 330 ml, or null), \"count\" (how "
+    "many in a multipack, or null), \"kcal_pack\" (kcal for the whole pack if printed, or null), "
+    "\"serving_g\" and \"kcal_serving\" (a serving's size and kcal, if printed, or null). Use null for anything "
+    "you can't read. No other text.")
+
+
+def _lnum(v, lo=0, hi=100000):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if lo < f < hi else None
+
+
+def parse_nutrition_reply(text, grams=None, count=None):
+    """The AI's reading, plus what's known about the pack, to calories for one whole unit, with the working out.
+    grams: what one unit weighs, if the item already says (the label's own figure wins)."""
+    m = re.search(r"\{.*\}", str(text or ""), re.S)
+    try:
+        d = json.loads(m.group(0)) if m else None
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        return None
+    k100 = _lnum(d.get("kcal_100g"), 0, 1000)
+    g = _lnum(d.get("grams")) or grams
+    n = _lnum(d.get("count"), 1, 1000)
+    kpack = _lnum(d.get("kcal_pack"))
+    out = {"kcal_100g": k100, "grams": g, "count": int(n) if n and n == int(n) else None,
+           "serving_g": _lnum(d.get("serving_g")), "kcal_serving": _lnum(d.get("kcal_serving"))}
+    if k100 and g:
+        out["kcal_per_unit"] = int(round(k100 * g / 100.0))
+        out["how"] = "%s kcal per 100 g × %s g = %s kcal" % (fq(k100), fq(g), out["kcal_per_unit"])
+    elif kpack:
+        out["kcal_per_unit"] = int(round(kpack))
+        out["how"] = "%s kcal for the whole pack, as printed" % fq(kpack)
+    elif k100:
+        out["kcal_per_unit"] = None
+        out["how"] = "%s kcal per 100 g: add the weight of the whole pack to work out the total" % fq(k100)
+    else:
+        return None
+    return out
+
+
+@route("POST", "/api/scan/nutrition")
+def api_scan_nutrition(body, query):
+    """Calories for one whole unit from a photo of the nutrition panel. grams: what one weighs, if known."""
+    grams = _lnum(body.get("grams"))
+    reply, ai = ai_ask(NUTRITION_PROMPT, photo_from(body), "Dads Army nutrition")
+    got = parse_nutrition_reply(reply, grams)
+    if not got:
+        raise ApiError(422, "Couldn't read the calories in that photo. Try the nutrition table, closer up and flat on.")
+    return dict(got, ai=ai)
 
 
 @route("POST", "/api/scan/label")
@@ -3587,7 +3843,8 @@ def ha_entities(s):
             "dates_read": ai["tasks"]["dates"], "labels_read": ai["tasks"]["labels"], "since": ai["since"]})
     except sqlite3.Error:
         pass
-    put("sensor.dads_army_food_days", s["food_days"], "Dads Army food", "mdi:food-drumstick", "days")
+    put("sensor.dads_army_food_days", s["food_days"], "Dads Army food", "mdi:food-drumstick", "days",
+        {"goes_off_first_days": s["food_wasted_days"]})
     put("sensor.dads_army_water_days", s["water_days"], "Dads Army water", "mdi:water", "days")
     put("sensor.dads_army_kit_stocked", s["kit_stocked_pct"], "Dads Army kit stocked", "mdi:toolbox", "%")
     put("sensor.dads_army_out_of_stock", len(s["out_of_stock"]), "Dads Army out of stock",

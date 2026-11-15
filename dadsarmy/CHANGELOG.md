@@ -2,6 +2,15 @@
 
 ## 1.13.0
 
+**How long the food lasts**
+
+- **Food that goes off before you'd get to it doesn't count.** Food and water days are worked out by eating whatever goes off first, a day at a time: 10 days of bread that goes off on Tuesday counts only until Tuesday. The Sitrep says how many days' worth goes off first, and `sensor.dads_army_food_days` has it as `goes_off_first_days`.
+- **Drinks** is a new category: juice, milk, squash and fizzy drinks. Their calories count towards food; they don't count as drinking water. Scans put juices and soft drinks there.
+- **Calories are for one whole tin or pack, never a serving**, and the form says so ("Calories in one whole tin (not per serving)"), with what that is in an adult's day underneath, so a per-serving figure stands out.
+- **Multipacks count the whole pack:** "6 x 330 ml" gives the calories for all six, even when Open Food Facts lists one can's size.
+- **📷 Read the nutrition label**, next to the calories and on a scan result with no calories: the AI reads the kcal per 100 g (and the weight) from a photo of the nutrition table and works out the whole pack, showing the sum for you to check. A per-serving figure is noted, not used.
+- **Fill in missing details** (HQ → Scanning, or **Fill in with AI** on the Sitrep): the AI estimates calories, what one holds and how long it keeps once opened, from the names alone, for the food and drinks missing them. You see each one and untick any that look wrong; nothing is saved until you do, and saved figures show **AI estimate** until you change them.
+
 **Scan to add and use stock**
 
 - **Scan a barcode** from **Stores**, or from an empty store. On a phone with the Home Assistant app over https, the camera reads it as soon as it's in the box, with a torch button for dark cupboards. Anywhere the live camera isn't allowed, it takes a photo instead. Or type the numbers.
