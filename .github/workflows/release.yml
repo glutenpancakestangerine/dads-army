@@ -1,0 +1,61 @@
+# Releases. Home Assistant offers an update as soon as the version in dadsarmy/config.yaml changes
+# on main, whether it was pushed or came in with a pull request. This checks every pull request and
+# push for a version that agrees in config.yaml, server.py and CHANGELOG.md, and tags each new
+# version on main as vX.Y.Z, with its changelog entry. See tools/release_check.py.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:   # "Run workflow" on the Actions tab, to run it by hand
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Same version in config.yaml, server.py and CHANGELOG.md
+        id: version
+        run: |
+          version=$(python3 tools/release_check.py)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Version $version: config.yaml, server.py and CHANGELOG.md agree." >> "$GITHUB_STEP_SUMMARY"
+
+  tag:
+    name: Tag the release
+    needs: check
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # to push the tag
+    concurrency:
+      group: release-tag
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # with the tags, to see whether this version is tagged already
+
+      - name: Tag it, if this version is new
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "$tag is already tagged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          { echo "$tag"; echo; python3 tools/release_check.py --notes; } > "$RUNNER_TEMP/notes.md"
+          git tag -a "$tag" -F "$RUNNER_TEMP/notes.md" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+          echo "Tagged $tag on ${GITHUB_SHA::7}." | tee -a "$GITHUB_STEP_SUMMARY"

@@ -141,10 +141,16 @@ You can change the words after a name; nobody is added twice. If one person show
 
 ## Releasing an update
 
+Home Assistant offers an update as soon as the version in `dadsarmy/config.yaml` changes on `main`. So any change that raises the version is a release, whether it's pushed or merged from a pull request.
+
 1. Pull first (`git pull --rebase`): the credits workflow may have added names on GitHub. Then make the changes in `dadsarmy/`.
 2. Raise the version number in both `dadsarmy/config.yaml` and `VERSION` in `dadsarmy/server.py`.
 3. Add an entry at the top of `dadsarmy/CHANGELOG.md`. Home Assistant shows it in the update dialog.
-4. Commit, tag (`git tag v1.2.0`) and push, including the tag.
+4. Commit and push, or merge the pull request.
+
+There's no need to tag it. A GitHub Action (`.github/workflows/release.yml`) checks that the three versions agree and tags the release on `main` as `v1.2.0`, with its changelog entry as the message. It checks every pull request too, so a mismatch shows before it's merged. To check by hand, run `python3 tools/release_check.py`.
+
+**Pull requests:** the template asks contributors to raise the version and add a changelog entry, so merging their pull request is the release. If one changes the app without raising the version, merging it releases nothing until someone does.
 
 Home Assistant checks for updates on its own. To check straight away, use **Settings → Updates → ⋮ → Check for updates**.
 
@@ -155,6 +161,7 @@ Home Assistant checks for updates on its own. To check straight away, use **Sett
 - `dadsarmy/places/uk.tsv.gz`: the list of UK places for **Places to go**. It's built from an OpenStreetMap extract by `tools/build_places.py`, which needs [pyosmium](https://osmcode.org/pyosmium/). The app itself only reads the finished file.
 - `dadsarmy/config.yaml` and `Dockerfile`: the Home Assistant app definition.
 - `dadsarmy/CREDITS.md`: the thank-you and the names shown under Help → Credits, kept up to date by `tools/update_credits.py` and `.github/workflows/credits.yml`.
+- `.github/workflows/release.yml` and `tools/release_check.py`: check the version on every pull request and push, and tag each release.
 - `tests/`: about 130 tests of the server, backups, undo, Home Assistant sync and the feeds, using stand-ins for Home Assistant and the feeds, so they never touch the internet. Run them from the repository folder with `python3 -m unittest discover -s tests`.
 - Your data lives in a single SQLite file, `dadsarmy.db`. On Raspberry Pi OS it's in `~/dadsarmy/data`; on Home Assistant it's in the app's own storage.
 
