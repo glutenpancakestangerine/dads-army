@@ -17,8 +17,10 @@ Dads Army shows this page in the app, under Help → Credits.
 - The app carries a copy of this file, so it shows even with no internet.
   New names reach everyone with the next update, or straight away when
   someone taps "Check GitHub for new names" in the app.
-- Anyone who makes a change on GitHub is added automatically under
-  "Code on GitHub" when the app checks, even before they're named here.
+- Anyone who changes Dads Army is added under "Built by" automatically,
+  a minute or so after their change reaches main, by a GitHub Action
+  (.github/workflows/credits.yml). Change the words after their name as
+  you like: nobody is added twice. Bots and AI assistants aren't added.
 -->
 
 Thank you.
