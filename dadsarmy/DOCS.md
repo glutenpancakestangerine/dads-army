@@ -408,6 +408,27 @@ The Sitrep's **Trends** card charts how many days the food and water would last,
 
 Dads Army records one line a day from 1.11.0, and keeps five years. When it first runs as a Home Assistant app, it fills in the days Home Assistant still remembers for the Dads Army sensors (usually the last ten).
 
+## Scanning
+
+**Adding things.** In **Stores**, tap **📷 Scan** and hold the barcode inside the box. On a phone using the Home Assistant app over https, the camera reads it as soon as it's in view. Browsers only allow a live camera over https, so on plain http (or if you say no to the camera), Scan takes a photo instead. **Type the numbers** is always there too.
+
+- **A barcode you've scanned before** goes straight to its item. Choose **Putting it in the stores** or **Taking it out to use**.
+- **A new barcode** is looked up in Open Food Facts, a free database of food products. Only the barcode is sent. You get the name (in English), the size and the calories. **Add as a new item**, or tap something you already keep: another brand of baked beans can go on the same line, with its own batches. The barcode is remembered either way.
+- **No barcode, or Open Food Facts doesn't know it?** Tap **Read the label**. An AI reads the name, size, calories and best before date from a photo of the pack, for you to check before adding.
+
+**Best before dates.** When adding stock or a new item, **📷 Read it from a photo** fills in the date for you to check. Or type it, or use **Same as …** for a date you already have.
+
+**Taking one out.** If you have more than one batch, **Use** asks which it's from (the oldest is ticked). **📷 Match the date on it** reads the date from a photo and ticks that batch.
+
+**Part of a pack.** In an item's details, **Each one holds** says what one holds: a 500 g bag, or 6 for a 6-pack. Then **Use** lets you say **an amount** (200 g, or 1 can) or **What's left** in the open one, and the item shows "1 bag + 300 g in the open one". **Once opened, use within** says how long it keeps once opened (an open tin of beans: about 3 days in the fridge). Using part of one makes the rest its own batch, marked as opened, which goes off then and is used first.
+
+**Which AI reads the photos.** In **HQ → Scanning**:
+
+- **Home Assistant AI Task** (the default) uses whatever AI you've set up in Home Assistant under **Settings → Devices & services**: Google Gemini, Anthropic or OpenAI. Gemini is tried first, then the others.
+- Or choose **Anthropic Claude** (Claude Haiku 5.5), **Google Gemini** or **OpenAI** and paste an API key. The key stays on the Pi, is never shown back and isn't included in backups.
+
+It costs about 0.1p a photo. The photo is put in Home Assistant's media folder only while the AI reads it, then deleted.
+
 ## On a tablet or a wider screen
 
 On a screen 900 pixels wide or more, such as a landscape tablet on the wall:

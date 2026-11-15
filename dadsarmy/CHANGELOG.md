@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.12.0
+
+**Scan to add and use stock**
+
+- **Scan a barcode** from **Stores**, or from an empty store. On a phone with the Home Assistant app over https, the camera reads it as soon as it's in the box, with a torch button for dark cupboards. Anywhere the live camera isn't allowed, it takes a photo instead. Or type the numbers.
+- **Something you've scanned before** goes straight to its item: **Putting it in the stores** or **Taking it out to use**.
+- **Something new** is looked up in Open Food Facts: the name (in English), size and calories. Add it as a new item, or **add it to something you already keep**, so another brand of baked beans goes on the same line with its own batches. The barcode is remembered either way, and it's in backups.
+- **No barcode, or not in Open Food Facts?** The AI reads the label from a photo: the name, size, calories and best before date, for you to check.
+- **Read the best before date from a photo** when adding stock or a new item, or type it as before.
+- **Which AI:** Home Assistant's own AI Task (whatever you've set up there: Google Gemini, Anthropic Claude or OpenAI), or one of those directly with your own key, in **HQ → Scanning**. Keys stay on the Pi, are never shown back and aren't in backups. A photo is deleted as soon as it's been read. About 0.1p a photo.
+- The barcode reader is the open-source ZXing library, included with the app (MIT licence), so it works without the internet.
+
+**One line per product, many batches**
+
+- **Add stock** has **Same as …** for each best before date you already have, and each batch on an item's page has **More like this** (the same date and place).
+- Typing a new item that's already in the stores offers to add stock to it instead.
+
+**Part of a pack**
+
+- **Each one holds:** say what one holds (a 500 g bag, a 1 kg bag, 6 cans in a pack). Scans fill it in.
+- **Use** then offers whole ones, **an amount** (200 g, or single cans from a pack), or **What's left** in the open one (300 g). The item shows "1 bag + 300 g in the open one".
+- **Once opened, use within:** an open tin of beans keeps about 3 days. Using part of one makes the rest its own batch, dated when it was opened. It goes off then, even if its best before is later, and it's used first. New stock never joins an opened pack.
+- **Which batch is it from?** When there's more than one, **Use** asks, with the oldest ticked. **Match the date on it** reads the date from a photo and ticks that batch, so the right one goes down.
+
 ## 1.11.0
 
 **Fixes**

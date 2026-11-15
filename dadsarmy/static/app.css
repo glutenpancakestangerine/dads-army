@@ -955,3 +955,38 @@ svg text { stroke: none; fill: currentColor; }   /* the svg rule above is for ic
   .grip { height: 14px; }
   .grip::after { display: none; }
 }
+
+/* Scanning (1.12.0) */
+.search-row { display: flex; gap: 8px; align-items: stretch; }
+.search-row .search { flex: 1 1 auto; min-width: 0; }
+.scan-btn { flex: none; white-space: nowrap; }
+@media (max-width: 420px) { .scan-btn span { display: none; } }
+.date-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.date-row input[type="date"] { flex: 1 1 160px; }
+.batch-more { font-size: 12.5px; white-space: nowrap; align-self: center; }
+.scan-choice { display: grid; gap: 10px; margin: 6px 0 12px; }
+.scan-all { margin-top: 12px; }
+.scan-all > summary { cursor: pointer; font-weight: 650; min-height: 36px; }
+.add-ways { align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.live-wrap { position: relative; border-radius: 12px; overflow: hidden; background: #000; aspect-ratio: 4 / 3; margin: 4px 0 8px; }
+.live-wrap video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.live-box { position: absolute; left: 12%; right: 12%; top: 32%; bottom: 32%; border: 3px solid rgba(255,255,255,.9);
+  border-radius: 12px; box-shadow: 0 0 0 999px rgba(0,0,0,.35); }
+.live-torch { position: absolute; right: 10px; bottom: 10px; }
+.live-alt { justify-content: center; flex-wrap: wrap; }
+.center { text-align: center; }
+.err { color: var(--bad); }
+.pack-row { display: flex; gap: 8px; align-items: center; }
+.pack-row input { flex: 1 1 auto; min-width: 0; }
+.pack-row select { flex: 0 0 auto; width: auto; }
+.pack-u { font-weight: 650; color: var(--muted); }
+.use-mode { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.use-mode .seg-opt input { position: absolute; opacity: 0; pointer-events: none; }
+.use-mode .seg-opt span { display: inline-flex; align-items: center; min-height: 40px; padding: 0 14px; border: 1px solid var(--line);
+  border-radius: 999px; cursor: pointer; font-weight: 600; font-size: 14px; }
+.use-mode .seg-opt input:checked + span { background: var(--olive); border-color: var(--olive); color: #fff; }
+.use-mode .seg-opt input:focus-visible + span { outline: 2px solid var(--olive); outline-offset: 2px; }
+.use-batches .opt small { color: var(--muted); }
+.callout { border-radius: 10px; padding: 10px 12px; margin: 0 0 12px; background: var(--surface-2, rgba(127,127,127,.12)); }
+.opts { display: grid; gap: 6px; }
+.opts .opt { display: flex; gap: 10px; align-items: center; min-height: 40px; }

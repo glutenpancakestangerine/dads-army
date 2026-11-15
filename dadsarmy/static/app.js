@@ -337,8 +337,27 @@
       throw new Error("Can't reach HQ - check the Pi and your Wi-Fi.");
     });
   }
+  // An opened pack keeps for the item's "once opened" days: its batch goes off then, or at its best before
+  // if that's sooner. Opened packs are used first, as the Pi takes them.
+  function openedDates(data) {
+    (data.items || []).forEach(function (it) {
+      (it.batches || []).forEach(function (b) {
+        b.printed_expiry = b.expiry;
+        if (!b.opened_at || !(it.open_days > 0)) return;
+        var d = parseYmd(b.opened_at.slice(0, 10));
+        d.setDate(d.getDate() + it.open_days);
+        b.open_until = ymd(d);
+        if (!b.expiry || b.open_until < b.expiry) b.expiry = b.open_until;
+      });
+      (it.batches || []).sort(function (a, b) {
+        return (a.opened_at ? 0 : 1) - (b.opened_at ? 0 : 1) || (a.expiry ? 0 : 1) - (b.expiry ? 0 : 1) ||
+          (a.expiry || '').localeCompare(b.expiry || '') || a.id - b.id;
+      });
+    });
+  }
   function refresh() {
     return api('GET', 'api/state').then(function (data) {
+      openedDates(data);
       S = data;
       updateDatalists();
       render();
@@ -401,6 +420,7 @@
     return '<div class="card empty"><div class="crate">📦</div><h2>Stores are empty</h2>' +
       '<p>Load a starter list of essentials sized for your household, or add your own items one at a time.</p>' +
       '<div class="btn-stack"><button class="btn primary block" data-act="seed">Load starter list</button>' +
+      '<button class="btn block" data-act="scan">📷 Scan what you have</button>' +
       '<button class="btn block" data-act="new">' + ICON.plus + ' Add an item</button></div></div>' +
       '<div class="card"><p class="small muted" style="margin:0">Starter targets will be sized for <b>' +
       st.adults + ' adult' + (st.adults === 1 ? '' : 's') + '</b> and <b>' + st.children + ' child' + (st.children === 1 ? '' : 'ren') +
@@ -728,7 +748,8 @@
     if (el.dataset.view !== 'stores' || !$('#q', el)) {
       el.dataset.view = 'stores';
       el.innerHTML =
-        '<div class="search">' + ICON.search + '<input type="search" id="q" placeholder="Search item, place or note" autocomplete="off" enterkeyhint="search" aria-label="Search stores"></div>' +
+        '<div class="search-row"><div class="search">' + ICON.search + '<input type="search" id="q" placeholder="Search item, place or note" autocomplete="off" enterkeyhint="search" aria-label="Search stores"></div>' +
+        '<button class="btn scan-btn" data-act="scan" aria-label="Scan a barcode">📷<span> Scan</span></button></div>' +
         '<div class="chips scroll-x" id="catChips"></div>' +
         '<div class="filters"><select id="fShow" aria-label="Show">' + SHOW_OPTS.map(opt).join('') + '</select>' +
         '<select id="fSort" aria-label="Sort by">' + SORT_OPTS.map(opt).join('') + '</select></div>' +
@@ -2078,6 +2099,7 @@
       'Anything you already have is skipped. To clear out what you don\'t need, use <b>Select to delete</b> in Stores.</p>' +
       '<button class="btn block" data-act="seed">Load starter list</button></section>';
 
+    html += scanHqCard();
     html += warnHqCard() + homeCard() + haCard();
 
     html += '<section class="card"><div class="card-head"><h2>Appearance</h2></div><div class="seg" role="group" aria-label="Theme">' +
@@ -2276,6 +2298,7 @@
   function showSheet(resetScroll) {
     var root = $('#sheet-root');
     if (!stack.length) {
+      stopLive();
       root.hidden = true;
       document.body.classList.remove('sheet-open');
       $('#sheet-body').innerHTML = '';
@@ -2293,11 +2316,14 @@
   function renderSheet() {
     var s = stack[stack.length - 1];
     if (!s) return;
+    if (s.type === 'livescan' && LIVE && $('#liveVideo')) return;   // the camera is running: a refresh mustn't replace it
+    if (s.type !== 'livescan') stopLive();
     var html = {
       item: sheetItem, edit: sheetEdit, stock: sheetStock, use: sheetUse, batch: sheetBatch, text: sheetText, halists: sheetHaLists,
       check: sheetCheck, plan: sheetPlan, warning: sheetWarning, warnset: sheetWarnSet, help: sheetHelp, dashwiz: sheetDashWiz,
       level: sheetLevel, levelhelp: sheetLevelHelp, homesensors: sheetHomeSensors, area: sheetArea, resall: sheetResAll,
-      place: sheetPlace, live: sheetLive
+      place: sheetPlace, live: sheetLive, scanned: sheetScanned, scancode: sheetScanCode, scanhit: sheetScanHit,
+      livescan: sheetLiveScan, scanfail: sheetScanFail
     }[s.type](s);
     if (html === null) {   // the item was deleted elsewhere
       closeSheet();
@@ -2305,6 +2331,7 @@
     }
     $('#sheet-body').innerHTML = html;
     if (s.type === 'edit') perDayHint($('#itemForm'));
+    if (s.type === 'livescan') startLive();
   }
   function sheetHead(title, sub, icon) {
     return '<div class="sheet-head">' + (icon ? '<span class="li-ico">' + icon + '</span>' : '') +
@@ -2314,9 +2341,14 @@
   function stat(value, label) {
     return '<div class="stat"><span class="stat-val">' + esc(value) + '</span><span class="stat-lbl">' + esc(label) + '</span></div>';
   }
-  function expiryField(val, usual) {
+  function expiryField(val, usual, dates) {
     return '<div class="field"><span>Best before / expiry</span>' +
-      '<input type="date" name="expiry" value="' + esc(val || '') + '" aria-label="Best before date">' +
+      '<div class="date-row"><input type="date" name="expiry" value="' + esc(val || '') + '" aria-label="Best before date">' +
+      '<button type="button" class="btn small" data-act="scan-date">📷 Read it from a photo</button></div>' +
+      '<div class="hint" data-scan-hint hidden></div>' +
+      (dates && dates.length ? '<div class="quick">' + dates.map(function (d) {
+        return '<button type="button" class="chip" data-expdate="' + esc(d) + '">Same as ' + esc(fmtDate(d)) + '</button>';
+      }).join('') + '</div>' : '') +
       '<div class="quick">' + (usual ? '<button type="button" class="chip" data-exp="' + usual + '">Like last time (+' + monthsWords(usual) + ')</button>' : '') +
       [[6, '6 months'], [12, '1 year'], [24, '2 years'], [60, '5 years'], [300, '25 years']].map(function (m) {
         return '<button type="button" class="chip" data-exp="' + m[0] + '">+' + m[1] + '</button>';
@@ -2348,14 +2380,18 @@
         ? '<span class="badge ' + (es === 'ok' ? 'ok' : es) + '">' + esc(expiryWords(b.expiry)) + '</span>' + esc(fmtDate(b.expiry))
         : '<span class="badge plain">No expiry</span>';
       return '<div class="batch"><button class="batch-main" data-act="batch" data-id="' + b.id + '" data-item="' + it.id + '">' +
-        '<span class="batch-exp">' + exp + '</span><span class="batch-meta">' + (b.location ? esc(b.location) : 'No location set') +
+        '<span class="batch-exp">' + exp + '</span><span class="batch-meta">' +
+        (b.opened_at ? '<b>Opened ' + esc(fmtDate(b.opened_at.slice(0, 10))) + '</b>' + (b.open_until ? ' · keeps until ' + esc(fmtDate(b.open_until)) : '') + ' · ' : '') +
+        (b.location ? esc(b.location) : 'No location set') +
         ' · added ' + esc(fmtDate(b.added_at)) + '</span></button>' +
+        '<button class="link batch-more" data-act="stock-like" data-id="' + it.id + '" data-likeexp="' + esc(b.printed_expiry || '') + '" data-loc="' + esc(b.location || '') + '">More like this</button>' +
         '<div class="mini-step"><button class="qbtn" data-act="bstep" data-id="' + b.id + '" data-d="-1" aria-label="One less">' + ICON.minus + '</button>' +
         '<output>' + esc(fq(b.qty)) + '</output>' +
         '<button class="qbtn" data-act="bstep" data-id="' + b.id + '" data-d="1" aria-label="One more">' + ICON.plus + '</button></div></div>';
     }).join('');
     return sheetHead(it.name, c.label + (it.unit ? ' · per ' + it.unit : ''), c.icon) +
       '<div class="stats">' + stats.join('') + '</div>' +
+      (packWords(it, i.total) ? '<p class="small muted">' + esc(packWords(it, i.total)) + '</p>' : '') +
       (use ? '<p class="usage">📈 You use ' + esc(use.text) + '. <span class="muted">From ' + use.uses + ' uses since ' + esc(fmtDate(use.since)) + '.</span></p>' : '') +
       '<div class="btn-row"><button class="btn" data-act="use-sheet" data-id="' + it.id + '"' + (i.none ? ' disabled' : '') + '>' + ICON.minus + ' Use</button>' +
       '<button class="btn primary" data-act="stock" data-id="' + it.id + '">' + ICON.plus + ' Add stock</button></div>' +
@@ -2369,14 +2405,23 @@
   function sheetEdit(s) {
     var it = s.id ? byId(s.id) : null;
     if (s.id && !it) return null;
-    var v = it || { name: '', category: s.cat || 'food', unit: '', kcal_per_unit: 0, litres_per_unit: 0, target_qty: 0, per_day: 0, price: 0, notes: '' };
+    var pre = s.pre || {};
+    var v = it || { name: pre.name || '', category: pre.category || s.cat || 'food', unit: pre.unit || '', kcal_per_unit: pre.kcal_per_unit || 0,
+      litres_per_unit: pre.litres_per_unit || 0, target_qty: 0, per_day: 0, price: 0, notes: '',
+      pack_size: pre.count > 1 ? pre.count : (pre.grams || 0), pack_unit: pre.count > 1 ? 'each' : pre.grams ? (pre.category === 'water' ? 'ml' : 'g') : '', open_days: 0 };
     var cats = CATS.map(function (c) {
       return '<label class="cat-opt"><input type="radio" name="category" value="' + c.id + '"' + (c.id === v.category ? ' checked' : '') + '>' +
         '<span><i>' + c.icon + '</i>' + esc(c.short || c.label) + '</span></label>';
     }).join('');
     return sheetHead(it ? 'Edit item' : 'New item', it ? it.name : 'Add something to the stores') +
-      '<form id="itemForm" data-cat="' + esc(v.category) + '" data-id="' + (it ? it.id : '') + '" novalidate>' +
-      '<label class="field"><span>Name</span><input type="text" name="name" value="' + esc(v.name) + '" maxlength="120" placeholder="e.g. Baked beans (415g)" autocomplete="off"' + (it ? '' : ' data-autofocus') + '></label>' +
+      '<form id="itemForm" data-cat="' + esc(v.category) + '" data-id="' + (it ? it.id : '') + '"' +
+      (s.code ? ' data-barcode="' + esc(s.code) + '" data-product="' + esc(pre.name || '') + '"' : '') + ' novalidate>' +
+      (!it && !s.code && !pre.from_ai ? '<div class="btn-row add-ways"><button type="button" class="btn small" data-act="scan">📷 Scan a barcode</button>' +
+        '<button type="button" class="btn small" data-act="scan-label">🤖 Read the label</button><span class="small muted">or type it in below</span></div>' : '') +
+      (s.code ? '<p class="callout info small">Barcode ' + esc(s.code) + (pre.name ? ': details from Open Food Facts. Check them, then add.' : ': not in Open Food Facts, so fill it in once and it\'s remembered.') + '</p>'
+        : pre.from_ai ? '<p class="callout info small">Read from the label by the AI. Check the details and the date, then add.</p>' : '') +
+      '<label class="field"><span>Name</span><input type="text" name="name" value="' + esc(v.name) + '" maxlength="120" placeholder="e.g. Baked beans (415g)" autocomplete="off"' + (it ? '' : ' data-autofocus') + '>' +
+      (it ? '' : '<div class="hint" data-dupe hidden></div>') + '</label>' +
       '<fieldset class="field"><legend>Category</legend><div class="cat-grid">' + cats + '</div></fieldset>' +
       '<div class="grid2"><label class="field"><span>Unit</span><input type="text" name="unit" value="' + esc(v.unit) + '" list="dl-units" placeholder="tin, pack, kg" maxlength="30" autocomplete="off"></label>' +
       '<label class="field"><span>Target stock</span><input type="number" name="target_qty" value="' + (v.target_qty || '') + '" inputmode="decimal" min="0" step="any" placeholder="0"></label></div>' +
@@ -2388,10 +2433,16 @@
       '<details class="calc"><summary>Work it out from the label</summary><div class="grid2">' +
       '<label class="field"><span>kcal per 100g</span><input type="number" data-calc="per100" inputmode="decimal" min="0" step="any"></label>' +
       '<label class="field"><span>Weight (g)</span><input type="number" data-calc="grams" inputmode="decimal" min="0" step="any"></label></div></details></div>' +
+      '<div class="field"><span>Each one holds</span><div class="pack-row"><input type="number" name="pack_size" value="' + (v.pack_size || '') + '" inputmode="decimal" min="0" step="any" placeholder="Optional, e.g. 500">' +
+      '<select name="pack_unit" aria-label="Pack size unit">' + [['g', 'g'], ['kg', 'kg'], ['ml', 'ml'], ['l', 'l'], ['oz', 'oz'], ['lb', 'lb'], ['each', 'items (a multipack)']].map(function (u) {
+        return '<option value="' + u[0] + '"' + ((v.pack_unit || 'g') === u[0] ? ' selected' : '') + '>' + u[1] + '</option>';
+      }).join('') + '</select></div><div class="hint">Lets you use part of one: 200 g of a 500 g bag, 1 can from a 6-pack, or say what\'s left in the open one.</div></div>' +
+      '<label class="field"><span>Once opened, use within (days)</span><input type="number" name="open_days" value="' + (v.open_days || '') + '" inputmode="numeric" min="0" step="1" placeholder="Optional, e.g. 3">' +
+      '<div class="hint">An open tin of beans keeps about 3 days in the fridge. Once you\'ve used part of one, the rest goes off then, even if its best before is later.</div></label>' +
       '<label class="field only-water"><span>Litres per unit</span><input type="number" name="litres_per_unit" value="' + (v.litres_per_unit || '') + '" inputmode="decimal" min="0" step="any" placeholder="e.g. 5">' +
       '<div class="hint">Drinkable water only. Leave empty for filters, tablets and containers.</div></label>' +
       (it ? '' : '<h3>Opening stock</h3><div class="field"><span>How many?</span>' + stepperHtml('qty', 1, 'Quantity') + '</div>' +
-        expiryField('') + locationField(lastLocation(lastTouched()))) +
+        expiryField(pre.expiry || '') + locationField(lastLocation(lastTouched()))) +
       '<label class="field"><span>Notes</span><textarea name="notes" rows="2" maxlength="2000" placeholder="Optional">' + esc(v.notes) + '</textarea></label>' +
       '<div class="sheet-actions"><button class="btn primary block" type="submit">' + (it ? 'Save changes' : 'Add to stores') + '</button></div></form>';
   }
@@ -2420,7 +2471,8 @@
     return sheetHead('Add stock', it.name, cat(it.category).icon) +
       '<form id="stockForm" data-id="' + it.id + '" novalidate>' +
       '<div class="field"><span>' + esc(howMany(it.unit)) + '</span>' + stepperHtml('qty', s.qty || 1, 'Quantity') + '</div>' +
-      expiryField('', usualLife(it)) + locationField(lastLocation(it) || lastLocation(lastTouched())) +
+      expiryField(s.exp || '', usualLife(it), batchDates(it)) + locationField(s.loc ? s.loc : (lastLocation(it) || lastLocation(lastTouched()))) +
+      '<p class="small muted">The same date and place as a batch you have adds to it. A different date starts a new batch.</p>' +
       '<div class="sheet-actions"><button class="btn primary block" type="submit">' + ICON.plus + ' Add to stores</button></div></form>';
   }
 
@@ -2428,11 +2480,30 @@
     var it = byId(s.id);
     if (!it) return null;
     var i = info(it);
+    var live = it.batches.filter(function (b) { return b.qty > 0; });
+    var pick = live.length > 1 ? '<fieldset class="field use-batches"><legend>Which batch is it from?</legend><div class="opts">' + live.map(function (b, n) {
+        return '<label class="opt"><input type="radio" name="batch_id" value="' + b.id + '"' + (n === 0 ? ' checked' : '') + ' data-exp="' + esc(b.expiry || '') + '"><span>' +
+          esc(b.expiry ? fmtDate(b.expiry) : 'No date') + ' · ' + esc(fq(b.qty)) + (b.location ? ' · ' + esc(b.location) : '') + (b.opened_at ? ' · opened' : '') +
+          (n === 0 ? ' <small>(use first)</small>' : '') + '</span></label>';
+      }).join('') + '</div><div class="date-row"><button type="button" class="btn small" data-act="scan-usebatch">📷 Match the date on it</button></div>' +
+      '<div class="hint" data-scan-hint hidden></div></fieldset>' : '';
+    var pk = it.pack_size > 0, pu = it.pack_unit || 'g', unitName = plural(it.unit || 'pack', 2);
+    var modes = pk ? '<div class="use-mode" role="radiogroup" aria-label="How to say what you used">' +
+      [['units', 'Whole ' + unitName], ['amount', pu === 'each' ? 'Single ones' : 'An amount (' + pu + ')'], ['left', 'What\'s left']].map(function (m, n) {
+        return '<label class="seg-opt"><input type="radio" name="mode" value="' + m[0] + '"' + (n === 0 ? ' checked' : '') + '><span>' + esc(m[1]) + '</span></label>';
+      }).join('') + '</div>' +
+      '<div class="field use-amount" hidden><span>How much did you use?</span><div class="pack-row"><input type="text" name="amount" inputmode="decimal" autocomplete="off" placeholder="' + (pu === 'each' ? 'e.g. 1' : 'e.g. 200') + '">' +
+      '<span class="pack-u">' + esc(pu === 'each' ? '' : pu) + '</span></div>' +
+      '<div class="hint">' + esc(pu === 'each' ? fq(it.pack_size) + ' in each ' + (it.unit || 'pack') : 'Each holds ' + fq(it.pack_size) + ' ' + pu) + '.</div></div>' +
+      '<div class="field use-left" hidden><span>How much is left in the open one?</span><div class="pack-row"><input type="text" name="left" inputmode="decimal" autocomplete="off" placeholder="' + (pu === 'each' ? 'e.g. 4' : 'e.g. 300') + '">' +
+      '<span class="pack-u">' + esc(pu === 'each' ? '' : pu) + '</span></div>' +
+      '<div class="hint">' + esc(packWords(it, i.total) ? 'Now: ' + packWords(it, i.total) + '.' : 'None open yet: this opens one.') + '</div></div>' : '';
     return sheetHead('Use stock', it.name, cat(it.category).icon) +
-      '<form id="useForm" data-id="' + it.id + '" novalidate>' +
-      '<div class="field"><span>' + esc(howMany(it.unit)) + '</span>' + stepperHtml('qty', 1, 'Quantity') +
+      '<form id="useForm" data-id="' + it.id + '" data-pack="' + (pk ? it.pack_size : 0) + '" novalidate>' + modes +
+      '<div class="field use-units"><span>' + esc(howMany(it.unit)) + '</span>' + stepperHtml('qty', 1, 'Quantity') +
       '<div class="quick"><button type="button" class="chip" data-setqty="' + i.total + '">All of it (' + esc(fq(i.total)) + ')</button></div>' +
-      '<div class="hint">You have ' + esc(qu(i.total, it.unit)) + '. The oldest expiry date is used first.</div></div>' +
+      '<div class="hint">You have ' + esc(qu(i.total, it.unit)) + (packWords(it, i.total) ? ' (' + esc(packWords(it, i.total)) + ')' : '') + '. ' +
+      (live.length > 1 ? 'Pick the batch it\'s from below.' : 'The oldest expiry date is used first.') + '</div></div>' + pick +
       '<div class="sheet-actions"><button class="btn primary block" type="submit">' + ICON.minus + ' Use it</button></div></form>';
   }
 
@@ -2443,10 +2514,324 @@
     return sheetHead('Edit batch', it.name, cat(it.category).icon) +
       '<form id="batchForm" data-id="' + b.id + '" novalidate>' +
       '<div class="field"><span>Quantity</span>' + stepperHtml('qty', fq(b.qty).replace(/,/g, ''), 'Quantity') + '</div>' +
-      expiryField(b.expiry) + locationField(b.location) +
+      expiryField(b.printed_expiry !== undefined ? b.printed_expiry : b.expiry) + locationField(b.location) +
       '<div class="sheet-actions"><button class="btn primary block" type="submit">Save batch</button>' +
       '<button class="btn danger block" type="button" data-act="del-batch" data-id="' + b.id + '">' + ICON.trash + ' Remove this batch</button></div></form>';
   }
+
+  // ------------------------------------------------------------------
+  // Scanning (1.12.0). Barcodes are read here on the phone, with the bundled ZXing library: from a live
+  // camera where the browser allows it (https only), otherwise from a photo. A new barcode is looked up in
+  // Open Food Facts on the Pi. Dates and labels are read from a photo by the AI chosen in HQ → Scanning.
+  // ------------------------------------------------------------------
+  // With a pack size: 1.6 bags of 500 g is "1 bag + 300 g in the open one".
+  function packWords(it, q) {
+    if (!(it.pack_size > 0)) return '';
+    var whole = Math.floor(q + 1e-6), part = Math.round((q - whole) * it.pack_size * 10) / 10;
+    if (part <= 0) return '';
+    if (it.pack_unit === 'each') part = Math.round(part);
+    var amt = it.pack_unit === 'each' ? fq(part) : fq(part) + ' ' + it.pack_unit;
+    return (whole ? fq(whole) + ' ' + plural(it.unit || 'pack', whole) + ' + ' : '') + amt + (whole ? ' in the open one' : ' left in the open one');
+  }
+  // The best before dates of the batches you have, newest first: one tap to add more of the same.
+  function batchDates(it) {
+    var seen = {};
+    return it.batches.filter(function (b) { var d = b.printed_expiry || b.expiry; return d && !b.opened_at && !seen[d] && (seen[d] = true); })
+      .map(function (b) { return b.printed_expiry || b.expiry; }).sort().reverse().slice(0, 3);
+  }
+
+  var zxingLoad = null;
+  function loadZXing() {
+    if (window.ZXing) return Promise.resolve(window.ZXing);
+    if (!zxingLoad) zxingLoad = new Promise(function (ok, no) {
+      var sc = document.createElement('script');
+      sc.src = 'zxing.min.js';
+      sc.onload = function () { ok(window.ZXing); };
+      sc.onerror = function () { zxingLoad = null; no(new Error('Couldn\'t load the barcode reader')); };
+      document.head.appendChild(sc);
+    });
+    return zxingLoad;
+  }
+  function takePhoto() {
+    return new Promise(function (ok) {
+      var inp = document.createElement('input');
+      inp.type = 'file'; inp.accept = 'image/*'; inp.setAttribute('capture', 'environment');
+      inp.style.display = 'none';
+      inp.addEventListener('change', function () { ok(inp.files && inp.files[0]); inp.remove(); });
+      document.body.appendChild(inp);
+      inp.click();
+    });
+  }
+  // A photo, scaled down, as a JPEG data: URL. Read with FileReader (data:, which the page's security
+  // policy allows; blob: isn't), as phones take far bigger photos than reading a label needs.
+  function shrinkPhoto(file, max) {
+    return new Promise(function (ok, no) {
+      var fail = function () { no(new Error('That photo couldn\'t be opened. Try again, or take it with the camera rather than choosing a file.')); };
+      if (!file || !file.size) { fail(); return; }
+      var rd = new FileReader();
+      rd.onerror = fail;
+      rd.onload = function () {
+        var img = new Image();
+        img.onload = function () {
+          var k = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+          var c = document.createElement('canvas');
+          c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+          c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+          ok(c.toDataURL('image/jpeg', 0.85));
+        };
+        img.onerror = fail;
+        img.src = rd.result;
+      };
+      rd.readAsDataURL(file);
+    });
+  }
+  function barcodeHints(Z) {
+    var hints = new Map();
+    hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [Z.BarcodeFormat.EAN_13, Z.BarcodeFormat.EAN_8, Z.BarcodeFormat.UPC_A, Z.BarcodeFormat.UPC_E]);
+    return hints;
+  }
+  function scanBarcode(btn) {
+    return takePhoto().then(function (file) {
+      if (!file) return;
+      return run(function () {
+        return Promise.all([loadZXing(), shrinkPhoto(file, 1600)]).then(function (r) {
+          var hints = barcodeHints(r[0]);
+          hints.set(r[0].DecodeHintType.TRY_HARDER, true);
+          return new r[0].BrowserMultiFormatReader(hints).decodeFromImageUrl(r[1]).then(function (res) {
+            return lookupBarcode(res.getText(), btn);
+          }, function () {
+            return openSheet({ type: 'scanfail', img: r[1] });   // no barcode in it: the AI can read the label
+          });
+        });
+      }, btn);
+    });
+  }
+  function lookupBarcode(code, btn) {
+    if (!/^[0-9]{6,14}$/.test(code || '')) { toast('Barcodes are 8 to 13 digits', { error: true }); return; }
+    return run(function () {
+      return api('GET', 'api/scan/barcode?code=' + encodeURIComponent(code)).then(function (r) {
+        if (stack.length && stack[stack.length - 1].type === 'scancode') closeSheet();
+        if (r.item_id && byId(r.item_id)) return openSheet({ type: 'scanhit', id: r.item_id });
+        return openSheet({ type: 'scanned', code: code, product: r.product, lookupError: r.lookup_error });
+      });
+    }, btn);
+  }
+  function sheetScanCode() {
+    return sheetHead('Type the barcode', 'The numbers under the bars', '🔢') +
+      '<div class="field"><span>Barcode</span><input type="text" id="scanCode" inputmode="numeric" pattern="[0-9]*" maxlength="14" autocomplete="off" data-autofocus></div>' +
+      '<div class="sheet-actions"><button class="btn primary block" data-act="scan-code">Look it up</button>' +
+      '<button class="btn block" data-act="scan-photo">📷 Try another photo</button></div>';
+  }
+  // A barcode you've scanned before: putting one in, or taking one out?
+  function sheetScanHit(s) {
+    var it = byId(s.id);
+    if (!it) return null;
+    var i = info(it);
+    return sheetHead(it.name, qu(i.total, it.unit) + ' in stock', cat(it.category).icon) +
+      '<div class="scan-choice"><button class="btn primary block" data-act="stock" data-id="' + it.id + '">' + ICON.plus + ' Putting it in the stores</button>' +
+      '<button class="btn block" data-act="use-sheet" data-id="' + it.id + '"' + (i.none ? ' disabled' : '') + '>' + ICON.minus + ' Taking it out to use</button></div>' +
+      '<p class="small muted">Taking one out: if you have more than one batch, you can match the date on it, so the right batch goes down.</p>';
+  }
+  // A barcode we haven't seen: a new item, or another brand of something you already keep.
+  function sheetScanned(s) {
+    var p = s.product, words = ((p && p.name) || '').toLowerCase().replace(/[^a-z ]/g, ' ').split(/\s+/).filter(function (w) { return w.length > 2; });
+    var scored = S.items.map(function (it) {
+      var n = it.name.toLowerCase();
+      return { it: it, score: words.filter(function (w) { return n.indexOf(w) >= 0; }).length };
+    }).filter(function (x) { return x.score > 0; }).sort(function (a, b) { return b.score - a.score || a.it.name.localeCompare(b.it.name); }).slice(0, 6);
+    var row = function (it) {
+      return '<button class="li" data-act="scan-link" data-id="' + it.id + '"><span class="li-ico">' + cat(it.category).icon + '</span><span class="li-main">' +
+        '<span class="li-title">' + esc(it.name) + '</span><span class="li-sub">' + esc(qu(info(it).total, it.unit)) + ' in stock</span></span>' + ICON.chev + '</button>';
+    };
+    return sheetHead(p && p.name ? p.name : 'New barcode', s.code ? 'Barcode ' + s.code : 'Read from the label by the AI: check it', s.code ? '📦' : '🤖') +
+      (p ? '<p class="small">' + esc([p.quantity, p.kcal_per_unit ? p.kcal_per_unit + ' kcal each' : '', p.brand, p.expiry ? 'best before ' + fmtDate(p.expiry) : ''].filter(Boolean).join(' · ')) + '</p>'
+        : '<p class="small muted">' + (s.lookupError ? 'Couldn\'t reach Open Food Facts just now.' : 'Not in Open Food Facts.') + ' The AI can read the label instead, or type it in.</p>' +
+          '<button class="btn block" data-act="scan-label" data-code="' + esc(s.code || '') + '" style="margin-bottom:10px">🤖 Read the label with AI</button>') +
+      '<button class="btn primary block" data-act="scan-new">' + ICON.plus + ' Add as a new item</button>' +
+      (S.items.length ? '<h3>Or add it to something you already keep</h3><p class="small muted">Another brand of the same thing goes on the same line, with its own batches.' +
+        (s.code ? ' The barcode is remembered.' : '') + '</p>' +
+        (scored.length ? '<div class="list">' + scored.map(function (x) { return row(x.it); }).join('') + '</div>' : '') +
+        '<details class="scan-all"><summary>All items</summary><div class="list">' + S.items.slice().sort(byName).map(row).join('') + '</div></details>' : '');
+  }
+  // No barcode in the photo: the AI can read the label instead (name, size, calories, date).
+  function sheetScanFail(s) {
+    return sheetHead('No barcode found', 'In that photo', '🔍') +
+      '<p class="small">Some things have no barcode, or it\'s too creased or shiny to read. The AI can read the label instead: the name, size, calories and best before date.</p>' +
+      '<div class="scan-choice"><button class="btn primary block" data-act="scan-label-same">🤖 Read the label from this photo</button>' +
+      '<button class="btn block" data-act="scan-label">📷 Take a photo of the front of the pack</button>' +
+      '<button class="btn block" data-act="scan-photo">Try the barcode again</button>' +
+      '<button class="btn block" data-act="scan-type">🔢 Type the numbers</button></div>';
+  }
+  function readLabel(img, btn, code) {
+    return run(function () {
+      toast('Reading the label…');
+      return api('POST', 'api/scan/label', { image: img }).then(function (r) {
+        var top = stack.length && stack[stack.length - 1].type;
+        if (top === 'scanfail' || (top === 'scanned' && code)) closeSheet();
+        return openSheet({ type: 'scanned', code: code || '', product: r.product });   // a barcode stays with it
+      });
+    }, btn);
+  }
+  function scanDate(btn) {
+    var field = btn.closest('.field'), input = field.querySelector('input[type="date"]'), hint = field.querySelector('[data-scan-hint]');
+    return takePhoto().then(function (file) {
+      if (!file) return;
+      hint.hidden = false; hint.className = 'hint'; hint.textContent = 'Reading the date…';
+      return shrinkPhoto(file, 1280).then(function (img) { return api('POST', 'api/scan/date', { image: img }); }).then(function (r) {
+        if (r.date) {
+          input.value = r.date;
+          hint.innerHTML = 'Read as <b>' + esc(fmtDate(r.date)) + '</b>. Check it\'s right before saving.';
+        } else {
+          hint.className = 'hint err';
+          hint.textContent = 'Couldn\'t see a date in that photo. Try closer, with the date in the middle, or pick it.';
+        }
+      }, function (e) { hint.className = 'hint err'; hint.textContent = e.message; });
+    });
+  }
+  // Taking one out: read the date on it and tick the batch with that date (or the nearest).
+  function scanUseBatch(btn) {
+    var fs = btn.closest('fieldset'), hint = fs.querySelector('[data-scan-hint]');
+    return takePhoto().then(function (file) {
+      if (!file) return;
+      hint.hidden = false; hint.className = 'hint'; hint.textContent = 'Reading the date…';
+      return shrinkPhoto(file, 1280).then(function (img) { return api('POST', 'api/scan/date', { image: img }); }).then(function (r) {
+        var radios = $$('input[name="batch_id"]', fs);
+        if (!r.date) { hint.className = 'hint err'; hint.textContent = 'Couldn\'t see a date. Pick the batch instead.'; return; }
+        var t = parseYmd(r.date).getTime(), best = null, bestGap = Infinity;
+        radios.forEach(function (x) {
+          if (!x.dataset.exp) return;
+          var gap = Math.abs(parseYmd(x.dataset.exp).getTime() - t);
+          if (gap < bestGap) { best = x; bestGap = gap; }
+        });
+        if (best && bestGap <= 45 * 86400000) {
+          best.checked = true;
+          hint.innerHTML = 'Read as <b>' + esc(fmtDate(r.date)) + '</b>: that\'s the batch dated ' + esc(fmtDate(best.dataset.exp)) + '.';
+        } else {
+          hint.className = 'hint err';
+          hint.textContent = 'Read as ' + fmtDate(r.date) + ', which doesn\'t match a batch you have. Pick one, or check its date.';
+        }
+      }, function (e) { hint.className = 'hint err'; hint.textContent = e.message; });
+    });
+  }
+  // Typing a new item that's already in the stores: offer to add stock to it instead.
+  function dupeHint(f) {
+    var box = $('[data-dupe]', f);
+    if (!box) return;
+    var n = f.elements.name.value.trim().toLowerCase();
+    var hit = n.length > 2 && S.items.filter(function (it) { return it.name.toLowerCase() === n || it.name.toLowerCase().indexOf(n) === 0; })[0];
+    box.hidden = !hit;
+    box.innerHTML = hit ? 'You already have <b>' + esc(hit.name) + '</b>. <button type="button" class="link" data-act="dupe-stock" data-id="' + hit.id + '">Add stock to it instead</button>' : '';
+  }
+
+  // Live scanning: a viewfinder that reads the barcode as soon as it's in the box. Browsers only allow the
+  // camera on https; anywhere else (or if it's refused, or Home Assistant's page doesn't allow it) Scan takes a
+  // photo instead, for the rest of the visit.
+  var LIVE = null, LIVE_FAILED = false;
+  function liveOk() {
+    return !LIVE_FAILED && !!(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  }
+  function stopLive() {
+    if (!LIVE) return;
+    var l = LIVE;
+    LIVE = null;
+    try { if (l.reader) l.reader.reset(); } catch (e) { /* already stopped */ }
+    try { if (l.stream) l.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) { /* fine */ }
+  }
+  function sheetLiveScan() {
+    return sheetHead('Scan a barcode', 'Hold it inside the box', '📷') +
+      '<div class="live-wrap"><video id="liveVideo" playsinline muted autoplay></video><div class="live-box" aria-hidden="true"></div>' +
+      '<button type="button" class="btn small live-torch" data-act="scan-torch" hidden>🔦 Torch</button></div>' +
+      '<p class="small muted center" id="liveStatus" role="status">Starting the camera…</p>' +
+      '<div class="btn-row live-alt"><button class="btn" data-act="scan-photo">📷 Take a photo instead</button>' +
+      '<button class="btn" data-act="scan-label">🤖 No barcode? Read the label</button>' +
+      '<button class="btn" data-act="scan-type">🔢 Type the numbers</button></div>';
+  }
+  function liveStatus(text, bad) {
+    var el = $('#liveStatus');
+    if (el) { el.textContent = text; el.className = 'small center ' + (bad ? 'err' : 'muted'); }
+  }
+  function startLive() {
+    var v = $('#liveVideo');
+    if (!v || LIVE) return;
+    var token = {};
+    LIVE = { token: token };
+    var mine = function () { return LIVE && LIVE.token === token; };
+    loadZXing().then(function (Z) {
+      if (!mine()) return;
+      var reader = new Z.BrowserMultiFormatReader(barcodeHints(Z), 200);
+      LIVE.reader = reader;
+      return reader.decodeFromConstraints({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } } }, v,
+        function (res) {
+          if (!res || !mine()) return;
+          var code = res.getText();
+          try { if (navigator.vibrate) navigator.vibrate(60); } catch (e) { /* no buzz */ }
+          stopLive();
+          liveStatus('Got ' + code);
+          lookupBarcode(code);   // opens on top: close it to scan the next one
+        }).then(function () {
+          if (!mine()) return;
+          var st = v.srcObject, tr = st && st.getVideoTracks && st.getVideoTracks()[0];
+          LIVE.stream = st;
+          LIVE.track = tr;
+          var caps = tr && tr.getCapabilities ? tr.getCapabilities() : {};
+          if (caps && caps.torch) { var tb = $('.live-torch'); if (tb) tb.hidden = false; }
+          liveStatus('Point the camera at the barcode');
+        });
+    }).catch(function (e) {
+      if (mine()) stopLive();
+      LIVE_FAILED = true;
+      var framed = false;
+      try { framed = window.self !== window.top; } catch (x) { framed = true; }
+      var name = e && e.name;
+      liveStatus(name === 'NotAllowedError' ? (framed ? 'The live camera isn\'t allowed here: either camera permission was refused, or Home Assistant doesn\'t let add-ons use it. Scan will take a photo instead.'
+          : 'The camera wasn\'t allowed. Allow the camera for this browser, or take a photo instead.')
+        : name === 'NotFoundError' || name === 'OverconstrainedError' ? 'No camera found. Take a photo instead, or type the numbers.'
+        : 'The live camera isn\'t available here. Take a photo instead.', true);
+    });
+  }
+  function toggleTorch(btn) {
+    if (!LIVE || !LIVE.track) return;
+    LIVE.torch = !LIVE.torch;
+    LIVE.track.applyConstraints({ advanced: [{ torch: LIVE.torch }] }).then(function () {
+      btn.classList.toggle('primary', LIVE && LIVE.torch);
+    }, function () { btn.hidden = true; });
+  }
+
+  // HQ → Scanning: which AI reads dates and labels. Keys stay on the Pi and are never shown back.
+  var SCAN_AI = null;
+  function scanHqCard() {
+    if (!SCAN_AI) {
+      api('GET', 'api/scan/ai').then(function (r) { SCAN_AI = r; var el = $('#scanAiCard'); if (el) el.outerHTML = scanHqCard(); }, function () { /* offline */ });
+      return '<section class="card" id="scanAiCard"><div class="card-head"><h2>Scanning</h2></div><p class="small muted">Loading…</p></section>';
+    }
+    var c = SCAN_AI, P = c.providers, prov = c.provider;
+    var keyBox = prov === 'ha' ? '<p class="small muted">' + (c.ha_entities.length ? 'Uses ' + esc(c.ha_entities[0]) + (c.ha_entities.length > 1 ? ', then the others if it fails' : '') + '. Add or change AIs in Home Assistant: Settings → Devices &amp; services.'
+        : 'No AI Task set up in Home Assistant yet. Add Google Gemini, Anthropic or OpenAI there, or pick a provider here and add its key.') + '</p>'
+      : '<div class="field"><span>' + esc(P[prov].name) + ' API key</span>' +
+        '<input type="password" autocomplete="off" spellcheck="false" data-scanai="key_' + prov + '" placeholder="' + (c.keys_set.indexOf(prov) >= 0 ? 'Saved. Paste a new key to replace it' : 'Paste your key here') + '">' +
+        (c.keys_set.indexOf(prov) >= 0 ? '<button type="button" class="link" data-act="scanai-forget" data-prov="' + prov + '">Remove the saved key</button>' : '') + '</div>' +
+        '<div class="field"><span>Model</span><input type="text" autocomplete="off" data-scanai="model" value="' + esc(c.model) + '" placeholder="' + esc(P[prov].model) + '"></div>';
+    return '<section class="card" id="scanAiCard"><div class="card-head"><h2>Scanning</h2></div>' +
+      '<p class="small muted">Barcodes are read on this phone and looked up in Open Food Facts (only the barcode is sent). Best before dates, and labels without a barcode, are read from a photo by an AI: about 0.1p a photo.</p>' +
+      '<div class="field"><span>Who reads the photos</span><select data-scanai="provider" aria-label="Who reads the photos">' +
+      Object.keys(P).map(function (k) { return '<option value="' + k + '"' + (k === prov ? ' selected' : '') + '>' + esc(P[k].name) + (k !== 'ha' && c.keys_set.indexOf(k) >= 0 ? ' (key saved)' : '') + '</option>'; }).join('') +
+      '</select></div>' + keyBox + '</section>';
+  }
+  function saveScanAi(body) {
+    return api('PUT', 'api/scan/ai', body).then(function (r) { SCAN_AI = r; var el = $('#scanAiCard'); if (el) el.outerHTML = scanHqCard(); toast('Saved'); },
+      function (e) { toast(e.message, { error: true }); });
+  }
+  document.addEventListener('change', function (e) {
+    var t = e.target, k = t.dataset && t.dataset.scanai;
+    if (!k) return;
+    var v = t.value.trim();
+    if (k.indexOf('key_') === 0 && !v) return;   // an empty box never clears a saved key
+    var b = {};
+    b[k] = v;
+    if (k === 'provider') b.model = '';         // each provider has its own default model
+    saveScanAi(b);
+  });
+
 
   function sheetText(s) {
     return sheetHead(s.title, 'Select all and copy') +
@@ -2606,6 +2991,60 @@
         return openSheet({ type: 'edit', id: id });
       case 'stock':
         return openSheet({ type: 'stock', id: id, qty: a.dataset.qty ? +a.dataset.qty : 1 });
+      case 'stock-like':
+        return openSheet({ type: 'stock', id: id, exp: a.dataset.likeexp || '', loc: a.dataset.loc || '' });
+      case 'scan':
+        return liveOk() ? openSheet({ type: 'livescan' }) : scanBarcode(a);
+      case 'scan-photo':
+        stopLive();
+        return scanBarcode(a);
+      case 'scan-type':
+        stopLive();
+        return openSheet({ type: 'scancode' });
+      case 'scan-torch':
+        return toggleTorch(a);
+      case 'scan-code':
+        return lookupBarcode((($('#scanCode') || {}).value || '').replace(/\s+/g, ''), a);
+      case 'scan-new': {
+        var top = stack[stack.length - 1];
+        return openSheet({ type: 'edit', id: null, code: top.code, pre: top.product || {}, cat: (top.product || {}).category || 'food' });
+      }
+      case 'scan-link': {
+        var sc = stack[stack.length - 1];
+        if (!sc.code) {   // read from the label: nothing to remember, straight to adding stock
+          closeSheet();
+          return openSheet({ type: 'stock', id: id, exp: (sc.product || {}).expiry || '' });
+        }
+        return run(function () {
+          return api('POST', 'api/scan/link', { code: sc.code, item_id: id, product: (sc.product || {}).name || '' }).then(function () {
+            closeSheet();
+            toast('Barcode added to ' + (byId(id) || {}).name + '. Next time it goes straight there.');
+            return openSheet({ type: 'stock', id: id });
+          });
+        }, a);
+      }
+      case 'scan-label': {
+        stopLive();
+        var lcode = a.dataset.code || '';
+        return takePhoto().then(function (file) {
+          if (!file) return;
+          return shrinkPhoto(file, 1600).then(function (img) { return readLabel(img, a, lcode); });
+        });
+      }
+      case 'scan-label-same':
+        return readLabel(stack[stack.length - 1].img, a);
+      case 'scan-date':
+        return scanDate(a);
+      case 'scan-usebatch':
+        return scanUseBatch(a);
+      case 'dupe-stock':
+        closeSheet();
+        return openSheet({ type: 'stock', id: id });
+      case 'scanai-forget': {
+        var fb = {};
+        fb['key_' + a.dataset.prov] = null;
+        return saveScanAi(fb);
+      }
       case 'use-sheet':
         return openSheet({ type: 'use', id: id });
       case 'batch':
@@ -2981,10 +3420,12 @@
       var body = {
         name: d.name, category: d.category || 'other', unit: d.unit || '', notes: d.notes || '',
         target_qty: num(d.target_qty), kcal_per_unit: num(d.kcal_per_unit), litres_per_unit: num(d.litres_per_unit),
-        per_day: num(d.per_day), price: num(d.price)
+        per_day: num(d.per_day), price: num(d.price),
+        pack_size: num(d.pack_size), pack_unit: num(d.pack_size) ? (d.pack_unit || 'g') : '', open_days: num(d.open_days)
       };
       var id = f.dataset.id;
       if (!id) { body.qty = num(d.qty); body.expiry = d.expiry || null; body.location = d.location || ''; }
+      if (!id && f.dataset.barcode) { body.barcode = f.dataset.barcode; body.product = f.dataset.product || ''; }
       return run(function () {
         return api(id ? 'PUT' : 'POST', id ? 'api/items/' + id : 'api/items', body).then(function () {
           closeSheet();
@@ -3004,10 +3445,24 @@
       }, btn);
     }
     if (f.id === 'useForm') {
-      var uq = num(d.qty);
+      var uq = num(d.qty), pack = +f.dataset.pack || 0, uit = byId(+f.dataset.id);
+      if (pack && d.mode === 'amount') {
+        if (!(num(d.amount) > 0)) { toast('How much did you use?', { error: true }); return; }
+        uq = Math.round(num(d.amount) / pack * 1000) / 1000;
+      } else if (pack && d.mode === 'left') {
+        var left = num(d.left);
+        if (d.left === '' || left < 0) { toast('How much is left in it?', { error: true }); return; }
+        // The open one is the batch picked (or the first): its part-used amount, or a whole one if none is open.
+        var bsel = uit && uit.batches.filter(function (b) { return b.qty > 0 && (!d.batch_id || b.id === +d.batch_id); })[0];
+        var frac = bsel ? bsel.qty - Math.floor(bsel.qty + 1e-6) : 0, open = frac > 1e-6 ? frac : 1;
+        uq = Math.round((open - left / pack) * 1000) / 1000;
+        if (!(uq > 0)) { toast('That\'s as much as was in it, so nothing\'s been used', { error: true }); return; }
+      }
       if (uq <= 0) { toast('How many are you using?', { error: true }); return; }
+      var ub = { qty: uq };
+      if (d.batch_id) ub.batch_id = +d.batch_id;
       return run(function () {
-        return api('POST', 'api/items/' + f.dataset.id + '/use', { qty: uq }).then(function (res) {
+        return api('POST', 'api/items/' + f.dataset.id + '/use', ub).then(function (res) {
           var it = byId(+f.dataset.id);
           closeSheet();
           return refresh().then(function () { toast('Used ' + qu(res.used, it ? it.unit : ''), { undo: res.undo }); });
@@ -3129,6 +3584,8 @@
     var t = e.target;
     var stepBtn = t.closest('[data-step]');
     if (stepBtn) { step(stepBtn); return; }
+    var expDate = t.closest('[data-expdate]');
+    if (expDate) { expDate.closest('.field').querySelector('input[type="date"]').value = expDate.dataset.expdate; return; }
     var expBtn = t.closest('[data-exp]');
     if (expBtn) {
       var input = expBtn.closest('.field').querySelector('input[type="date"]');
@@ -3173,6 +3630,15 @@
       if (per > 0 && g > 0) f.elements.kcal_per_unit.value = Math.round(per * g / 100);
     }
     if ((t.name === 'per_day' || t.name === 'target_qty') && t.form && t.form.id === 'itemForm') perDayHint(t.form);
+    if (t.name === 'name' && t.form && t.form.id === 'itemForm' && !t.form.dataset.id) dupeHint(t.form);
+    if (t.name === 'mode' && t.form && t.form.id === 'useForm') {
+      var uf = t.form;
+      $('.use-units', uf).hidden = t.value !== 'units';
+      $('.use-amount', uf).hidden = t.value !== 'amount';
+      $('.use-left', uf).hidden = t.value !== 'left';
+      var focusEl = t.value === 'amount' ? uf.elements.amount : t.value === 'left' ? uf.elements.left : null;
+      if (focusEl) focusEl.focus();
+    }
     if (t.name === 'every_days') syncEvery(t.closest('.field'));
   });
 
