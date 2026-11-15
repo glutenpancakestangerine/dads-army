@@ -2283,6 +2283,12 @@
     else { stack.pop(); showSheet(true); }
   }
   // Close every open sheet at once (each was a step in history), then carry on.
+  // Saved: back to where you were. After a scan, that's the stores, not the scan result you came from.
+  var SCAN_SHEETS = ['livescan', 'scanned', 'scanhit', 'scanfail', 'scancode'];
+  function doneSheet() {
+    if (stack.some(function (x) { return SCAN_SHEETS.indexOf(x.type) >= 0; })) closeAllSheets();
+    else closeSheet();
+  }
   function closeAllSheets(then) {
     var n = stack.length, hs = history.state && history.state.daSheet;
     if (!n) return then && then();
@@ -3428,7 +3434,7 @@
       if (!id && f.dataset.barcode) { body.barcode = f.dataset.barcode; body.product = f.dataset.product || ''; }
       return run(function () {
         return api(id ? 'PUT' : 'POST', id ? 'api/items/' + id : 'api/items', body).then(function () {
-          closeSheet();
+          doneSheet();
           return refresh().then(function () { toast(id ? 'Saved' : body.name + ' added to the stores'); });
         });
       }, btn);
@@ -3439,7 +3445,7 @@
       return run(function () {
         return api('POST', 'api/items/' + f.dataset.id + '/stock', { qty: qty, expiry: d.expiry || null, location: d.location || '' }).then(function () {
           var it = byId(+f.dataset.id);
-          closeSheet();
+          doneSheet();
           return refresh().then(function () { toast('Added ' + qu(qty, it ? it.unit : '') + (it ? ' · ' + it.name : '')); });
         });
       }, btn);
@@ -3464,7 +3470,7 @@
       return run(function () {
         return api('POST', 'api/items/' + f.dataset.id + '/use', ub).then(function (res) {
           var it = byId(+f.dataset.id);
-          closeSheet();
+          doneSheet();
           return refresh().then(function () { toast('Used ' + qu(res.used, it ? it.unit : ''), { undo: res.undo }); });
         });
       }, btn);
