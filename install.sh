@@ -40,6 +40,7 @@ if [ "$SRC" != "$DEST" ]; then
   cp -R "$APP/static" "$DEST/static"
   if [ -d "$APP/places" ]; then cp -R "$APP/places" "$DEST/places"; fi
   cp "$APP/server.py" "$DEST/server.py"
+  if [ -f "$APP/CREDITS.md" ]; then cp "$APP/CREDITS.md" "$DEST/CREDITS.md"; fi
   for f in install.sh README.md; do
     if [ -f "$SRC/$f" ]; then cp "$SRC/$f" "$DEST/$f"; fi
   done

@@ -50,7 +50,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -4045,7 +4045,7 @@ FEED_URLS = {
     # NASA FIRMS: satellite fire detections for Europe over the last 7 days (free, no account)
     "fires": "https://firms.modaps.eosdis.nasa.gov/data/active_fire/noaa-20-viirs-c2/csv/J1_VIIRS_C2_Europe_7d.csv",
     "fires_modis": "https://firms.modaps.eosdis.nasa.gov/data/active_fire/modis-c6.1/csv/MODIS_C6_1_Europe_7d.csv",
-    # Live information (1.12.0). Each is the whole country (or the whole network) in one go.
+    # Live information (1.11.0). Each is the whole country (or the whole network) in one go.
     "rivers": "https://environment.data.gov.uk/flood-monitoring/data/readings?latest&parameter=level",
     "river_stations": "https://environment.data.gov.uk/flood-monitoring/id/stations?parameter=level&_view=full",
     "power_ukpn": "https://ukpowernetworks.opendatasoft.com/api/explore/v2.1/catalog/datasets/ukpn-live-faults/exports/json",
@@ -4063,6 +4063,9 @@ FEED_URLS = {
     "space": "https://services.swpc.noaa.gov/products/noaa-scales.json",
     "pound": "https://www.bankofengland.co.uk/boeapps/database/_iadb-fromshowcolumns.asp?csv.x=yes&Datefrom={start}"
              "&Dateto=now&SeriesCodes=XUDLUSS,XUDLERS,IUDBEDR&CSVF=TN&UsingCodes=Y&VPD=Y&VFD=N",
+    # Credits (1.12.0): only when someone taps "Check GitHub for new names".
+    "credits": "https://raw.githubusercontent.com/parkerveese-cloud/dads-army/main/dadsarmy/CREDITS.md",
+    "contributors": "https://api.github.com/repos/parkerveese-cloud/dads-army/contributors?per_page=100",
 }
 try:   # for testing against local copies
     FEED_URLS.update(json.loads(os.environ.get("DADSARMY_FEED_URLS") or "{}"))
@@ -5833,6 +5836,188 @@ def api_warnings_check(body, query):
         WARN_DONE.wait_for(lambda: WARN_RUNS["n"] >= want, timeout=45)
     with LOCK:
         return {"warnings": warn_public()}
+
+
+# --------------------------------------------------------------------------
+# Credits: the people who built Dads Army, with thanks (Help -> Credits)
+# --------------------------------------------------------------------------
+# The words and names live in CREDITS.md in the GitHub repository, so they can be edited there.
+# The app carries its own copy, so the page works with no internet. "Check GitHub for new names"
+# fetches the latest copy and GitHub's list of code contributors: two fixed public addresses,
+# asked only when someone taps the button, with nothing about the household sent.
+CREDITS_REPO = "https://github.com/parkerveese-cloud/dads-army"
+CREDITS_EDIT = CREDITS_REPO + "/blob/main/dadsarmy/CREDITS.md"
+CREDITS_FILE = os.environ.get("DADSARMY_CREDITS", os.path.join(APP_DIR, "CREDITS.md"))
+CREDITS_MAX = 64 * 1024
+CREDITS_FALLBACK = "Thank you to everyone who has helped build Dads Army."
+GH_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
+GH_HANDLE_RE = re.compile(r"(?<![\w.@])@(" + GH_LOGIN_RE.pattern + r")(?![\w-])")
+MD_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https://[^)\s]+)\)")
+
+
+def _md_plain(s):
+    """Markdown down to plain words: links become their text, emphasis and code marks go."""
+    s = MD_LINK_RE.sub(lambda m: m.group(1), s or "")
+    s = re.sub(r"\*\*|__|`", "", s)
+    s = re.sub(r"(?<![\w*])\*(?=\S)([^*]+?)\*(?!\w)", r"\1", s)
+    s = re.sub(r"[\x00-\x1f\x7f]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _credit_entry(line):
+    """'Name (@github-name): what they did' -> {name, handle, url, note}. Only the name is needed."""
+    masked = MD_LINK_RE.sub(lambda m: "x" * len(m.group(0)), line)   # a colon inside a link isn't the split
+    cut = re.search(r":\s|\s[—–-]\s", masked)
+    who, note = (line[:cut.start()], line[cut.end():]) if cut else (line, "")
+    handle = None
+    h = GH_HANDLE_RE.search(who)
+    if h:
+        handle = h.group(1)
+        who = re.sub(r"\(\s*\)", "", who[:h.start()] + who[h.end():])
+    link = MD_LINK_RE.search(who)
+    name = _md_plain(who)[:120] or ("@" + handle if handle else "")
+    if not name:
+        return None
+    url = link.group(2) if link else ("https://github.com/" + handle if handle else None)
+    return {"name": name, "handle": handle, "url": url, "note": _md_plain(note)[:200]}
+
+
+def parse_credits(text):
+    """CREDITS.md -> {title, message: [paragraphs], groups: [{title, about, people}]}.
+    The paragraphs before the first '##' heading are the thank-you message."""
+    text = re.sub(r"<!--.*?(?:-->|\Z)", "", text or "", flags=re.S)
+    out = {"title": "Credits", "message": [], "groups": []}
+    para = []
+    cur = None
+
+    def flush():
+        if para:
+            words = _md_plain(" ".join(para))[:1500]
+            if words:
+                (cur["about"] if cur is not None else out["message"]).append(words)
+            del para[:]
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or re.fullmatch(r"([-*_])(\s*\1){2,}", line):   # a gap, or a --- rule
+            flush()
+        elif re.match(r"#\s", line):
+            flush()
+            out["title"] = _md_plain(line[1:])[:80] or "Credits"
+        elif line.startswith("##"):
+            flush()
+            cur = {"title": _md_plain(line.lstrip("#"))[:80], "about": [], "people": []}
+            out["groups"].append(cur)
+        elif re.match(r"[-*+]\s+\S", line):
+            flush()
+            if cur is None:
+                cur = {"title": "Contributors", "about": [], "people": []}
+                out["groups"].append(cur)
+            entry = _credit_entry(line[1:].strip())
+            if entry and len(cur["people"]) < 300:
+                cur["people"].append(entry)
+        else:
+            para.append(line)
+    flush()
+    out["message"] = out["message"][:8]
+    out["groups"] = [g for g in out["groups"] if g["people"] or g["about"]][:20]
+    return out
+
+
+def parse_contributors(data):
+    """GitHub's contributors list -> [{login, n}], people only (no bots), most changes first."""
+    if not isinstance(data, list):
+        raise ValueError("expected a list")
+    out = []
+    for c in data[:100]:
+        if not isinstance(c, dict) or c.get("type") != "User":
+            continue
+        login, n = c.get("login"), c.get("contributions")
+        if isinstance(login, str) and GH_LOGIN_RE.fullmatch(login) and isinstance(n, int) and not isinstance(n, bool) and n > 0:
+            out.append({"login": login, "n": n})
+    return out
+
+
+def credits_merge(parsed, people):
+    """Anyone with code on GitHub who isn't named in the file yet goes in a group of their own,
+    after the last group that names people by their GitHub name."""
+    known = set(p["handle"].lower() for g in parsed["groups"] for p in g["people"] if p["handle"])
+    extra = [p for p in people if p["login"].lower() not in known]
+    if not extra:
+        return parsed
+    at = 0
+    for i, g in enumerate(parsed["groups"]):
+        if any(p["handle"] for p in g["people"]):
+            at = i + 1
+    parsed["groups"].insert(at, {"title": "Code on GitHub", "about": [], "people": [
+        {"name": "@" + p["login"], "handle": p["login"], "url": "https://github.com/" + p["login"],
+         "note": "%d change%s" % (p["n"], "" if p["n"] == 1 else "s")} for p in extra]})
+    return parsed
+
+
+def credits_bundled():
+    try:
+        with open(CREDITS_FILE, "rb") as f:
+            return f.read(CREDITS_MAX).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def credits_cache():
+    cache = setting_raw("credits_cache", None)
+    return dict(cache) if isinstance(cache, dict) else {}
+
+
+def credits_view():
+    """What Help -> Credits shows: GitHub's copy if it was checked on this version, else the app's own."""
+    cache = credits_cache()
+    text, source = credits_bundled(), "app"
+    if isinstance(cache.get("text"), str) and cache.get("version") == VERSION:
+        text, source = cache["text"], "github"
+    parsed = parse_credits(text)
+    people = cache.get("people") if isinstance(cache.get("people"), list) else []
+    credits_merge(parsed, [p for p in people[:100] if isinstance(p, dict) and isinstance(p.get("login"), str)
+                           and GH_LOGIN_RE.fullmatch(p["login"]) and isinstance(p.get("n"), int)])
+    if not parsed["message"]:
+        parsed["message"] = [CREDITS_FALLBACK]
+    parsed.update(source=source, checked_at=cache.get("t"), check_error=cache.get("error"),
+                  repo=CREDITS_REPO, edit_url=CREDITS_EDIT,
+                  count=sum(len(g["people"]) for g in parsed["groups"]))
+    return parsed
+
+
+@route("GET", "/api/credits")
+def api_credits(body, query):
+    with LOCK:
+        return {"credits": credits_view()}
+
+
+@route("POST", "/api/credits/check")
+def api_credits_check(body, query):
+    """Fetch the latest credits list and GitHub's code contributors. Keeps what it has if either fails."""
+    with LOCK:
+        cache = credits_cache()
+    problems = []
+    try:
+        text = http_get(FEED_URLS["credits"], timeout=15, limit=CREDITS_MAX).decode("utf-8")
+        if re.search(r"<!doctype|<html", text[:2048], re.I):   # a Wi-Fi sign-in page or an error page
+            raise ValueError("it was a web page, not the list")
+        if not any(g["people"] for g in parse_credits(text)["groups"]):
+            raise ValueError("there were no names in it")
+        cache.update(text=text, version=VERSION)
+    except Exception as e:
+        problems.append("the credits list: " + why_failed(e))
+    try:
+        raw = http_get(FEED_URLS["contributors"], timeout=15, limit=1024 * 1024).decode("utf-8").strip()
+        cache["people"] = parse_contributors(json.loads(raw) if raw else [])   # an empty repository says nothing
+    except Exception as e:
+        problems.append("the list of code contributors: " + why_failed(e))
+    cache["t"] = now_iso()
+    cache["error"] = "; ".join(problems) or None
+    with tx() as db:
+        set_setting_raw(db, "credits_cache", cache)
+    with LOCK:
+        return {"credits": credits_view(), "ok": not problems}
 
 
 

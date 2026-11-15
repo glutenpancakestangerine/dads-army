@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.12.0
+
+**New**
+
+- **Credits.** Help → **Credits**, or the link at the foot of HQ, thanks everyone who has built Dads Army and lists them, with the open data it uses.
+  - The words and names come from `CREDITS.md` in the GitHub repository, so they can be changed there.
+  - The app carries its own copy, so the page works with no internet.
+  - **Check GitHub for new names** gets the latest list, and adds anyone who has changed the code on GitHub. GitHub is only asked when you tap it, and nothing about you is sent.
+
 ## 1.11.0
 
 **Fixes**

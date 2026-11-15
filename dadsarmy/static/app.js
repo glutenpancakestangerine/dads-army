@@ -1896,10 +1896,38 @@
       row('📋', 'Routine checks and your emergency plan', 'On the Plan tab', 'help-go', ' data-view="plan"') +
       row('🛒', 'Shopping for what\'s missing', 'The Supply run tab lists everything below target', 'help-go', ' data-view="supply"') +
       (S.items.length ? '' : row('📦', 'Load the starter list', 'About 95 essentials, sized for your household', 'seed')) +
+      row('💛', 'Credits', 'The people who built Dads Army, with thanks', 'credits') +
       '</div>' +
       (ha ? '<h3>Phone alerts</h3><p class="small muted">Two ready-made automations send warnings, run-outs, checks that are due and a weekly round-up to your phone. ' +
         'In Home Assistant, open <b>Settings → Apps → Dads Army → Documentation</b> and follow <b>Phone alerts</b>.</p>' : '') +
       '<p class="small muted" style="margin-top:14px">Dads Army v' + esc(S.server.version) + '</p>';
+  }
+
+  // Credits: the thank-you and the names come from CREDITS.md (the app's own copy, or GitHub's once checked).
+  function sheetCredits(s) {
+    var head = sheetHead('Credits', 'The people behind Dads Army', '💛'), c = s.data;
+    if (!c) return head + '<p class="small muted">Loading…</p>';
+    if (c.failed) return head + '<p class="small ha-error">' + esc(c.failed) + '</p>';
+    var html = head + '<div class="credits-thanks">' + c.message.map(function (p, i) {
+      return '<p' + (i === 0 && p.length <= 40 ? ' class="credits-lead"' : '') + '>' + esc(p) + '</p>';
+    }).join('') + '</div>';
+    c.groups.forEach(function (g) {
+      html += '<h3>' + esc(g.title) + '</h3>' + g.about.map(function (p) { return '<p class="small muted">' + esc(p) + '</p>'; }).join('');
+      if (g.people.length) {
+        html += '<ul class="credits-list">' + g.people.map(function (p) {
+          var name = p.url ? '<a href="' + esc(p.url) + '" target="_blank" rel="noopener noreferrer">' + esc(p.name) + '</a>' : esc(p.name);
+          var handle = p.handle && p.name.toLowerCase() !== '@' + p.handle.toLowerCase() ? ' <span class="credits-handle">@' + esc(p.handle) + '</span>' : '';
+          return '<li><span class="credits-name">' + name + handle + '</span>' + (p.note ? '<span class="credits-note">' + esc(p.note) + '</span>' : '') + '</li>';
+        }).join('') + '</ul>';
+      }
+    });
+    var from = c.source === 'github' ? 'Checked with GitHub ' + ago(c.checked_at) + '.' :
+      'This list came with Dads Army v' + S.server.version + (c.checked_at ? ', and GitHub was last asked ' + ago(c.checked_at) : '') + '.';
+    return html + '<div class="credits-foot">' +
+      '<p class="small muted">' + esc(from) + ' Checking asks GitHub for the latest list and the people who\'ve changed the code. Nothing about you is sent.</p>' +
+      (c.check_error ? '<p class="small ha-error">The last check had a problem with ' + esc(c.check_error) + '.</p>' : '') +
+      '<div class="btn-stack"><button class="btn block" type="button" data-act="credits-check">Check GitHub for new names</button>' +
+      '<a class="btn block" href="' + esc(c.edit_url) + '" target="_blank" rel="noopener noreferrer">Add a name on GitHub</a></div></div>';
   }
 
   // What the dashboard will look like, with today's numbers.
@@ -2087,7 +2115,8 @@
 
     html += '<section class="card"><div class="card-head"><h2>Activity log</h2><span class="small muted">last ' + S.log.length + '</span></div>' +
       (S.log.length ? logHtml(S.log) : '<p class="small muted">Nothing yet.</p>') + '</section>';
-    html += '<p class="tagline">Dads Army v' + esc(S.server.version) + ' · Don\'t panic</p>';
+    html += '<p class="tagline">Dads Army v' + esc(S.server.version) + ' · Don\'t panic</p>' +
+      '<p class="tagline-sub"><button class="link" type="button" data-act="credits">Credits</button>: with thanks to everyone who built it</p>';
     el.innerHTML = html;
   }
 
@@ -2297,7 +2326,7 @@
       item: sheetItem, edit: sheetEdit, stock: sheetStock, use: sheetUse, batch: sheetBatch, text: sheetText, halists: sheetHaLists,
       check: sheetCheck, plan: sheetPlan, warning: sheetWarning, warnset: sheetWarnSet, help: sheetHelp, dashwiz: sheetDashWiz,
       level: sheetLevel, levelhelp: sheetLevelHelp, homesensors: sheetHomeSensors, area: sheetArea, resall: sheetResAll,
-      place: sheetPlace, live: sheetLive
+      place: sheetPlace, live: sheetLive, credits: sheetCredits
     }[s.type](s);
     if (html === null) {   // the item was deleted elsewhere
       closeSheet();
@@ -2728,6 +2757,28 @@
         return checkWarnings(a);
       case 'help':
         return openSheet({ type: 'help' });
+      case 'credits': {
+        var cr = { type: 'credits', data: null };
+        openSheet(cr);
+        return api('GET', 'api/credits').then(function (d) { cr.data = d.credits; }, function (e) {
+          cr.data = { failed: e.message };
+        }).then(function () { if (stack[stack.length - 1] === cr) renderSheet(); });
+      }
+      case 'credits-check': {
+        var cs = stack[stack.length - 1];
+        if (!cs || cs.type !== 'credits' || !cs.data) return;
+        var before = cs.data.count || 0;
+        a.textContent = 'Asking GitHub…';
+        return run(function () {
+          return api('POST', 'api/credits/check').then(function (res) {
+            cs.data = res.credits;
+            if (stack[stack.length - 1] === cs) renderSheet();
+            var more = res.credits.count - before;
+            if (!res.ok) toast('Not everything could be checked with GitHub. There\'s a note at the bottom.', { error: true });
+            else toast(more > 0 ? more + ' new name' + (more === 1 ? '' : 's') + ' from GitHub' : 'Up to date: no new names');
+          });
+        }, a);
+      }
       case 'place-new':
         return openSheet({ type: 'place', id: null });
       case 'place-edit':

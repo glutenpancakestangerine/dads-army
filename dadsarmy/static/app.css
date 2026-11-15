@@ -955,3 +955,22 @@ svg text { stroke: none; fill: currentColor; }   /* the svg rule above is for ic
   .grip { height: 14px; }
   .grip::after { display: none; }
 }
+
+/* ---- 1.14 Credits ------------------------------------------------------ */
+.tagline-sub { text-align: center; font-size: 13px; color: var(--muted); margin: 0 0 8px; }
+.credits-thanks { background: var(--olive-tint); border-radius: 14px; padding: 14px 16px; margin: 4px 0 2px; color: var(--ink); }
+.credits-thanks p { margin: 0 0 10px; line-height: 1.55; }
+.credits-thanks p:last-child { margin-bottom: 0; }
+.credits-thanks .credits-lead { font: 700 22px var(--font-cond); letter-spacing: .02em; color: var(--olive-strong); }
+.credits-list { list-style: none; margin: 0; padding: 0; }
+.credits-list li { display: flex; flex-direction: column; gap: 2px; padding: 9px 0; border-top: 1px solid var(--line); }
+.credits-list li:first-child { border-top: 0; padding-top: 2px; }
+.credits-name { font-weight: 650; }
+.credits-name a { color: inherit; text-decoration-color: var(--line-strong); text-underline-offset: 2px; }
+.credits-handle { font-weight: 400; font-size: 13px; color: var(--muted); }
+.credits-note { font-size: 13.5px; color: var(--ink-2); }
+.credits-foot { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--line); }
+.credits-foot .btn-stack { margin-top: 10px; }
+@media (min-width: 900px) {
+  #view[data-view] > .tagline-sub { column-span: all; }
+}

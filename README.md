@@ -119,6 +119,12 @@ To update, run `git pull` and then `bash install.sh` again. Your data is kept.
 
 Dads Army has no login of its own. Anyone on your home network who can reach port 8080 can open it. Through the Home Assistant sidebar, only signed-in Home Assistant users can open it. **Don't** port-forward 8080 on your router. To reach it while you're out, use Home Assistant Cloud, Tailscale or WireGuard.
 
+## Credits
+
+Dads Army is built by people who want households across the UK to be ready for whatever comes. Their names are in [`dadsarmy/CREDITS.md`](dadsarmy/CREDITS.md), and the app shows them under Help → **Credits**.
+
+To add a name, or change the thank-you message, edit `CREDITS.md` on GitHub. Notes at the top of the file explain the layout. The app picks up the change with its next update, or straight away when someone taps **Check GitHub for new names**. Anyone who changes the code on GitHub is listed automatically when the app checks.
+
 ---
 
 ## Releasing an update

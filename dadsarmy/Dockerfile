@@ -9,6 +9,8 @@ COPY server.py /app/server.py
 COPY static /app/static
 # Possible refuges and help points across the UK, from OpenStreetMap (see places/README.md).
 COPY places /app/places
+# The thank-you and the names shown under Help -> Credits.
+COPY CREDITS.md /app/CREDITS.md
 
 # /data is the add-on's own storage: it survives restarts and updates
 # and is included in Home Assistant backups.

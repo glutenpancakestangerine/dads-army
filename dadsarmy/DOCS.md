@@ -442,6 +442,12 @@ Dads Army also notices how fast you actually use things. Once you've tapped **âˆ
 - Get a warning when `sensor.dads_army_supplies` drops below a week, so there's time to get more of your medicines.
 - Turn a light red, or announce on a speaker, when `sensor.dads_army_warnings` has a `max_severity` of 3 (a red warning, a severe flood warning or an Emergency Alert).
 
+## Credits
+
+Help â†’ **Credits**, or the link at the foot of HQ, thanks the people who built Dads Army and lists them, with the open data it uses. The list comes from `CREDITS.md` in the GitHub repository. The app carries its own copy, so it shows with no internet.
+
+**Check GitHub for new names** fetches the latest list, and adds anyone who has changed the code on GitHub. It's only fetched when you tap the button. Nothing about you is sent: it asks for two fixed public addresses on GitHub, the same place Home Assistant gets Dads Army's updates from.
+
 ## Your data
 
 Your data is kept in the app's own storage. It survives restarts and updates, and it's included in your Home Assistant backups. On top of that:
