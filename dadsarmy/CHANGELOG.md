@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.13.0
+
+**How long the food lasts**
+
+- **Food that goes off before you'd get to it doesn't count.** Food and water days are worked out by eating whatever goes off first, a day at a time: 10 days of bread that goes off on Tuesday counts only until Tuesday. The Sitrep says how many days' worth goes off first, and `sensor.dads_army_food_days` has it as `goes_off_first_days`.
+- **Drinks** is a new category: juice, milk, squash and fizzy drinks. Their calories count towards food; they don't count as drinking water. Scans put juices and soft drinks there.
+- **Calories are for one whole tin or pack, never a serving**, and the form says so ("Calories in one whole tin (not per serving)"), with what that is in an adult's day underneath, so a per-serving figure stands out.
+- **Multipacks count the whole pack:** "6 x 330 ml" gives the calories for all six, even when Open Food Facts lists one can's size.
+- **📷 Read the nutrition label**, next to the calories and on a scan result with no calories: the AI reads the kcal per 100 g (and the weight) from a photo of the nutrition table and works out the whole pack, showing the sum for you to check. A per-serving figure is noted, not used.
+- **Fill in missing details** (HQ → Scanning, or **Fill in with AI** on the Sitrep): the AI estimates calories, what one holds and how long it keeps once opened, from the names alone, for the food and drinks missing them. You see each one and untick any that look wrong; nothing is saved until you do, and saved figures show **AI estimate** until you change them.
+
+**Scan to add and use stock**
+
+- **Scan a barcode** from **Stores**, or from an empty store. On a phone with the Home Assistant app over https, the camera reads it as soon as it's in the box, with a torch button for dark cupboards. Anywhere the live camera isn't allowed, it takes a photo instead. Or type the numbers.
+- **Something you've scanned before** goes straight to its item: **Putting it in the stores** or **Taking it out to use**.
+- **Something new** is looked up in Open Food Facts: the name (in English), size and calories. Add it as a new item, or **add it to something you already keep**, so another brand of baked beans goes on the same line with its own batches. The barcode is remembered either way, and it's in backups.
+- **No barcode, or not in Open Food Facts?** The AI reads the label from a photo: the name, size, calories and best before date, for you to check.
+- **Nothing to scan at all** (a can from a multipack)? **Choose from your stores** picks the item, then put one in or take one out.
+- Reads GS1 DataBar (the wide, stretched barcodes on some own-brand packs), Code 128 and ITF as well as the usual ones. A 12-digit UPC code and the same code with a 0 in front are one barcode.
+- **Read the best before date from a photo** when adding stock or a new item, or type it as before.
+- **Which AI:** Home Assistant's own AI Task (whatever you've set up there: Google Gemini, Anthropic Claude or OpenAI), or one of those directly with your own key, in **HQ → Scanning**. Keys stay on the Pi, are never shown back, and are left out of backup files and the automatic database copies. A photo is deleted as soon as it's been read (and one left by a restart is tidied up). About 0.1p a photo.
+- **AI use and spending** in **HQ → Scanning**: this month's cost, answers, today's, and what's left of a **monthly limit** you set, with the last 15 calls. Once the limit is reached, nothing more goes to Claude, Gemini or OpenAI with your key until the 1st. Also in `sensor.dads_army_ai_spend`.
+- **Plain-words AI errors:** busy on the provider's side (it tries once more), allowance used up, no credit, or the key not accepted.
+- Closing one sheet and opening the next straight away (a scan result replacing **Type the numbers**, say) no longer loses the new one; Back still goes step by step. The **−** button is easier to see, and dashed when there's nothing to take away.
+- The barcode reader is the open-source ZXing library, included with the app (MIT licence), so it works without the internet.
+- **Offline barcode list.** In **HQ → Scanning**, keep a list of the products Open Food Facts lists as sold in the UK (about 180,000) on the Pi, so scanning a new barcode works with the internet down. It's built from Open Food Facts' public export (a 1.5 GB download, read as it arrives, about 25 MB on the Pi): the first time when it's switched on, then once a month overnight, or with **Update now**. Barcodes are looked up there first, then online. It's left out of Home Assistant backups, as it can always be downloaded again.
+
+**One line per product, many batches**
+
+- **Add stock** has **Same as …** for each best before date you already have, and each batch on an item's page has **More like this** (the same date and place).
+- Typing a new item that's already in the stores offers to add stock to it instead.
+
+**Part of a pack**
+
+- **Each one holds:** say what one holds (a 500 g bag, a 1 kg bag, 6 cans in a pack). Scans fill it in.
+- **Use** then offers whole ones, **an amount** (200 g, or single cans from a pack), or **What's left** in the open one (300 g). The item shows "1 bag + 300 g in the open one".
+- **Once opened, use within:** an open tin of beans keeps about 3 days. Using part of one makes the rest its own batch, dated when it was opened. It goes off then, even if its best before is later (in the app and in Home Assistant's sensors), and it's used first. New stock never joins an opened pack. Undo, backups and restores keep it opened.
+- Single cans from a multipack add up: one at a time, six times, leaves whole packs.
+- **Which batch is it from?** When there's more than one, **Use** asks, with the oldest ticked. **Match the date on it** reads the date from a photo and ticks that batch, so the right one goes down.
+
 ## 1.12.0
 
 **New**

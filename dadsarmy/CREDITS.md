@@ -32,6 +32,7 @@ Every line of code, idea, test and word of feedback here has helped a household 
 ## Built by
 
 - Parker Veese Development (@parkerveese-cloud): started Dads Army, and designs, builds and tests it
+- CP (@glutenpancakestangerine): contributed code
 
 ## Open data and maps
 
@@ -50,5 +51,6 @@ Every line of code, idea, test and word of feedback here has helped a household 
 - NESO and Elexon: electricity grid notices
 - National Gas: gas storage
 - Defra UK-AIR: air quality
+- [Open Food Facts contributors](https://world.openfoodfacts.org): product names, sizes and calories for scanned barcodes, under the Open Database Licence
 - NOAA Space Weather Prediction Center: space weather
 - Bank of England: the pound and Bank Rate

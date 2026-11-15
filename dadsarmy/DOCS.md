@@ -15,7 +15,7 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 |---|---|---|
 | `sensor.dads_army_readiness` | How close you are to your readiness target, in %. 100% means you could hold out for the full target. | `hold_out_days`, `target_days`, `target_met` |
 | `sensor.dads_army_hold_out` | Days you could hold out (the lower of food and water) | `food_days`, `water_days`, `runs_out_first`, `target_days`, `target_met`, `people` |
-| `sensor.dads_army_food_days` | Days of food | |
+| `sensor.dads_army_food_days` | Days of food, eating whatever goes off first | `goes_off_first_days` |
 | `sensor.dads_army_water_days` | Days of water | |
 | `sensor.dads_army_kit_stocked` | Kit and supplies against their targets, in % | |
 | `sensor.dads_army_out_of_stock` | Items with a target but none in stock that's still in date | `items` (each has `name`, `get`, `unit` and `text`), `total` |
@@ -408,6 +408,37 @@ The Sitrep's **Trends** card charts how many days the food and water would last,
 
 Dads Army records one line a day from 1.11.0, and keeps five years. When it first runs as a Home Assistant app, it fills in the days Home Assistant still remembers for the Dads Army sensors (usually the last ten).
 
+## Scanning
+
+**Adding things.** In **Stores**, tap **📷 Scan** and hold the barcode inside the box. On a phone using the Home Assistant app over https, the camera reads it as soon as it's in view. Browsers only allow a live camera over https, so on plain http (or if you say no to the camera), Scan takes a photo instead. **Type the numbers** is always there too.
+
+- **A barcode you've scanned before** goes straight to its item. Choose **Putting it in the stores** or **Taking it out to use**.
+- **A new barcode** is looked up in Open Food Facts, a free database of food products. Only the barcode is sent. You get the name (in English), the size and the calories. **Add as a new item**, or tap something you already keep: another brand of baked beans can go on the same line, with its own batches. The barcode is remembered either way.
+- **No barcode, or Open Food Facts doesn't know it?** Tap **Read the label**. An AI reads the name, size, calories and best before date from a photo of the pack, for you to check before adding.
+- **Known, but no calories?** Tap **📷 Read the nutrition label** and photograph the nutrition table. The AI reads the kcal per 100 g and the weight, and works out the calories for the whole pack ("78 kcal per 100 g × 415 g = 324 kcal"). The same button is next to the calories when you add or edit something.
+- **Nothing to scan at all** (a single can from a multipack)? **Choose from your stores** lets you pick the item, then put one in or take one out.
+
+The reader knows the usual shop barcodes (EAN and UPC), plus GS1 DataBar (the wide, stretched ones on some own-brand packs), Code 128 and ITF.
+
+**Best before dates.** When adding stock or a new item, **📷 Read it from a photo** fills in the date for you to check. Or type it, or use **Same as …** for a date you already have.
+
+**Taking one out.** If you have more than one batch, **Use** asks which it's from (the oldest is ticked). **📷 Match the date on it** reads the date from a photo and ticks that batch.
+
+**Part of a pack.** In an item's details, **Each one holds** says what one holds: a 500 g bag, or 6 for a 6-pack. Then **Use** lets you say **an amount** (200 g, or 1 can) or **What's left** in the open one, and the item shows "1 bag + 300 g in the open one". **Once opened, use within** says how long it keeps once opened (an open tin of beans: about 3 days in the fridge). Using part of one makes the rest its own batch, marked as opened, which goes off then and is used first.
+
+**Calories and how long the food lasts.** Calories are for **one whole unit as you count it**: the whole tin, the whole bag, the whole 6-pack, never a serving. Dads Army adds up the calories in date, then eats them in date order, a day at a time, against what the household needs a day (HQ → Household). Food that would go off before you got to it doesn't count, and the Sitrep says how much that is. **Drinks** (juice, milk, squash) count as food, not as drinking water. Things with no calories set don't count at all: **Fill in missing details** in **HQ → Scanning** has the AI estimate them from their names, for you to check, marked **AI estimate** until you change them.
+
+**Which AI reads the photos.** In **HQ → Scanning**:
+
+- **Home Assistant AI Task** (the default) uses whatever AI you've set up in Home Assistant under **Settings → Devices & services**: Google Gemini, Anthropic or OpenAI. Gemini is tried first, then the others.
+- Or choose **Anthropic Claude** (Claude Haiku 5.5), **Google Gemini** or **OpenAI** and paste an API key. The key stays on the Pi, is never shown back, and is left out of backup files and the automatic database copies (paste it in again after a restore).
+
+It costs about 0.1p a photo. The photo is put in Home Assistant's media folder only while the AI reads it, then deleted.
+
+**AI use and spending.** **HQ → Scanning** shows what the AI has cost this month (worked out from each call's tokens and the provider's list price), how many answers it has given, today's, and what's left of your **monthly limit**, with the last 15 calls underneath. Once the limit is reached, nothing more is sent to Claude, Gemini or OpenAI with your key until the 1st. The limit doesn't cover the Home Assistant AI Task route, which is billed there. `sensor.dads_army_ai_spend` has the same figures for a dashboard or an automation. If the AI fails, it says why in plain words: busy on the provider's side (it tries once more), allowance used up, no credit, or the key not accepted.
+
+**Scanning with the internet down.** Barcodes you've scanned before always work. For new ones, switch on **Keep a list of UK products on the Pi** in **HQ → Scanning**. Dads Army then downloads Open Food Facts' public export (about 1.5 GB) and keeps the products sold in the UK, about 180,000 of them in 25 MB. It does this straight away, then once a month between 2 and 5 in the morning; **Update now** does it on demand. If a download goes wrong, the old list stays. The list is left out of Home Assistant backups. Reading a date or a label from a photo still needs the internet: type the date instead. Product data © Open Food Facts contributors, under the Open Database Licence.
+
 ## On a tablet or a wider screen
 
 On a screen 900 pixels wide or more, such as a landscape tablet on the wall:
@@ -440,6 +471,7 @@ Dads Army also notices how fast you actually use things. Once you've tapped **�
 - Flash a light or announce on a speaker when the `dads_army_ran_out` event fires.
 - Get a reminder when `sensor.dads_army_readiness` drops below 100%.
 - Get a warning when `sensor.dads_army_supplies` drops below a week, so there's time to get more of your medicines.
+- Get a notification when `sensor.dads_army_ai_spend` passes most of its `limit_usd`.
 - Turn a light red, or announce on a speaker, when `sensor.dads_army_warnings` has a `max_severity` of 3 (a red warning, a severe flood warning or an Emergency Alert).
 
 ## Credits

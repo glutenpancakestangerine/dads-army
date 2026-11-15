@@ -477,7 +477,7 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--olive); out
 .cat-opt input:focus-visible + span { outline: 2px solid var(--olive); outline-offset: 2px; }
 
 .only-food, .only-water { display: none; }
-form[data-cat="food"] .only-food, form[data-cat="water"] .only-water { display: block; }
+form[data-cat="food"] .only-food, form[data-cat="drinks"] .only-food, form[data-cat="pets"] .only-food, form[data-cat="water"] .only-water { display: block; }
 
 details.calc { margin-top: 6px; }
 details.calc summary { font-size: 13px; color: var(--olive); font-weight: 600; cursor: pointer; }
@@ -974,3 +974,55 @@ svg text { stroke: none; fill: currentColor; }   /* the svg rule above is for ic
 @media (min-width: 900px) {
   #view[data-view] > .tagline-sub { column-span: all; }
 }
+/* Scanning (1.13.0) */
+.search-row { display: flex; gap: 8px; align-items: stretch; }
+.search-row .search { flex: 1 1 auto; min-width: 0; }
+.scan-btn { flex: none; white-space: nowrap; }
+@media (max-width: 420px) { .scan-btn span { display: none; } }
+.date-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.date-row input[type="date"] { flex: 1 1 160px; }
+.batch-more { font-size: 12.5px; white-space: nowrap; align-self: center; }
+.scan-choice { display: grid; gap: 10px; margin: 6px 0 12px; }
+.scan-all { margin-top: 12px; }
+.scan-all > summary { cursor: pointer; font-weight: 650; min-height: 36px; }
+.add-ways { align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.live-wrap { position: relative; border-radius: 12px; overflow: hidden; background: #000; aspect-ratio: 4 / 3; margin: 4px 0 8px; }
+.live-wrap video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.live-box { position: absolute; left: 12%; right: 12%; top: 32%; bottom: 32%; border: 3px solid rgba(255,255,255,.9);
+  border-radius: 12px; box-shadow: 0 0 0 999px rgba(0,0,0,.35); }
+.live-torch { position: absolute; right: 10px; bottom: 10px; }
+.live-alt { justify-content: center; flex-wrap: wrap; }
+.center { text-align: center; }
+.err { color: var(--bad); }
+.pack-row { display: flex; gap: 8px; align-items: center; }
+.pack-row input { flex: 1 1 auto; min-width: 0; }
+.pack-row select { flex: 0 0 auto; width: auto; }
+.pack-u { font-weight: 650; color: var(--muted); }
+.use-mode { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.use-mode .seg-opt input { position: absolute; opacity: 0; pointer-events: none; }
+.use-mode .seg-opt span { display: inline-flex; align-items: center; min-height: 40px; padding: 0 14px; border: 1px solid var(--line);
+  border-radius: 999px; cursor: pointer; font-weight: 600; font-size: 14px; }
+.use-mode .seg-opt input:checked + span { background: var(--olive); border-color: var(--olive); color: #fff; }
+.use-mode .seg-opt input:focus-visible + span { outline: 2px solid var(--olive); outline-offset: 2px; }
+.use-batches .opt small { color: var(--muted); }
+.callout { border-radius: 10px; padding: 10px 12px; margin: 0 0 12px; background: var(--surface-2, rgba(127,127,127,.12)); }
+.opts { display: grid; gap: 6px; }
+.opts .opt { display: flex; gap: 10px; align-items: center; min-height: 40px; }
+.offline-toggle { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 8px 0; cursor: pointer; }
+.offline-toggle-text { display: flex; flex-direction: column; gap: 2px; }
+.offline-toggle-title { font-weight: 650; }
+.offline-toggle-hint { font-size: 13px; color: var(--muted); }
+.offline-toggle input { width: 22px; height: 22px; flex: none; }
+.ai-meter { height: 8px; border-radius: 4px; background: var(--surface-2); overflow: hidden; margin: -6px 0 10px; }
+.ai-meter > span { display: block; height: 100%; background: var(--olive); }
+.stat[data-state="warn"] .stat-val { color: var(--warn, #b26a00); }
+.stat[data-state="bad"] .stat-val { color: var(--bad, #b3261e); }
+.ai-calls { margin-top: 8px; }
+.ai-calls > summary { cursor: pointer; font-weight: 650; min-height: 36px; }
+.ai-table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 8px 0 4px; }
+.ai-table th, .ai-table td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.ai-table th:first-child, .ai-table td:first-child { text-align: left; }
+.ai-table th { color: var(--muted); font-weight: 650; font-size: 12px; }
+/* The − button: easy to see in light mode, and plainly switched off when there's nothing to take away. */
+.qbtn { border: 1.5px solid color-mix(in srgb, var(--ink) 38%, transparent); }
+.qbtn:disabled { opacity: .45; border-style: dashed; }

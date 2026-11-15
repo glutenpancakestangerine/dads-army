@@ -46,11 +46,12 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -61,7 +62,7 @@ PORT = int(os.environ.get("DADSARMY_PORT", "8080"))
 KEEP_BACKUPS = max(1, int(os.environ.get("DADSARMY_KEEP_BACKUPS", "14")))
 MAX_BODY = 20 * 1024 * 1024
 
-CATEGORIES = ["food", "water", "medical", "power", "cooking", "hygiene",
+CATEGORIES = ["food", "water", "drinks", "medical", "power", "cooking", "hygiene",
               "tools", "comms", "shelter", "docs", "pets", "other"]
 
 DEFAULT_SETTINGS = {
@@ -220,12 +221,21 @@ CREATE TABLE IF NOT EXISTS history (
 """
 # Columns added to items after 1.0, for databases made by older versions.
 ITEM_UPGRADES = [("per_day", "REAL NOT NULL DEFAULT 0"), ("price", "REAL NOT NULL DEFAULT 0"),
+                 # 1.13.0: what one holds (a 500 g bag, a 6-pack), so part of one can be used; and how long it
+                 # keeps once opened (an open tin of beans: 3 days)
+                 ("pack_size", "REAL NOT NULL DEFAULT 0"), ("pack_unit", "TEXT NOT NULL DEFAULT ''"),
+                 ("open_days", "REAL NOT NULL DEFAULT 0"),
                  # 1.11.0: a change counter, so an undo can't overwrite a newer change made on another phone;
                  # and, for things from the starter list, which one (so targets can follow the household).
                  ("rev", "INTEGER NOT NULL DEFAULT 0"), ("starter", "TEXT NOT NULL DEFAULT ''"),
-                 ("auto_target", "INTEGER NOT NULL DEFAULT 0")]
+                 ("auto_target", "INTEGER NOT NULL DEFAULT 0"),
+                 # 1.13.0: fields the AI estimated ("kcal_per_unit,open_days"), until you change them
+                 ("ai_guessed", "TEXT NOT NULL DEFAULT ''")]
+KCAL_CATS = ("food", "drinks")   # what feeds the household: juice and milk count as food, not drinking water
 ITEM_FIELDS = ("name", "category", "unit", "kcal_per_unit", "litres_per_unit", "target_qty", "per_day", "price",
-               "notes")
+               "notes", "pack_size", "pack_unit", "open_days")
+ITEM_DEFAULTS = {"pack_size": 0, "pack_unit": "", "open_days": 0}
+PACK_UNITS = ("g", "kg", "ml", "l", "oz", "lb", "each")   # "each": a multipack, counted in single ones
 
 # --------------------------------------------------------------------------
 # Starter list. Targets scale to the household (see resolve_target).
@@ -439,6 +449,19 @@ def init_db():
     for col, decl in ITEM_UPGRADES:
         if col not in have:
             DB.execute("ALTER TABLE items ADD COLUMN %s %s" % (col, decl))
+    if "opened_at" not in set(r[1] for r in DB.execute("PRAGMA table_info(batches)")):
+        DB.execute("ALTER TABLE batches ADD COLUMN opened_at TEXT")   # 1.13.0: the part-used pack, and when
+    DB.execute("CREATE TABLE IF NOT EXISTS barcodes (code TEXT PRIMARY KEY, "
+               "item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE, product TEXT NOT NULL DEFAULT '', "
+               "added_at TEXT NOT NULL)")   # 1.13.0: barcodes scanned, each pointing at one item
+    DB.execute("CREATE TABLE IF NOT EXISTS ai_calls (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, "
+               "ai TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', task TEXT NOT NULL DEFAULT '', "
+               "tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0, cost_usd REAL, "
+               "ok INTEGER NOT NULL DEFAULT 1, note TEXT NOT NULL DEFAULT '')")   # 1.13.0: what the AI cost
+    DB.execute("CREATE INDEX IF NOT EXISTS idx_ai_calls_ts ON ai_calls(ts)")
+    # 1.13.0: one code per product (a 12-digit UPC-A is kept as its 13-digit EAN, a 0 in front).
+    DB.execute("UPDATE OR IGNORE barcodes SET code = '0' || code WHERE length(code) = 12")
+    DB.execute("DELETE FROM barcodes WHERE length(code) = 12")
     for key, value in DEFAULT_SETTINGS.items():
         DB.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(value)))
     with tx() as db:
@@ -532,12 +555,20 @@ def clean_item(body, partial=False):
             out[field] = clean_num(body.get(field), 0, 0, 1e7, label)
     if not partial or "notes" in body:
         out["notes"] = clean_text(body.get("notes"), 2000)
+    if not partial or "pack_size" in body or "pack_unit" in body:
+        size = clean_num(body.get("pack_size"), 0, 0, 1e6, "Pack size")
+        unit = clean_text(body.get("pack_unit"), 4).lower()
+        if size and unit not in PACK_UNITS:
+            raise ApiError(400, "Pack size is in g, kg, ml, l, oz, lb or each")
+        out["pack_size"], out["pack_unit"] = (size, unit) if size else (0, "")
+    if not partial or "open_days" in body:
+        out["open_days"] = int(round(clean_num(body.get("open_days"), 0, 0, 365, "Days once opened")))
     return out
 
 
 def insert_item(db, data, created, updated, item_id=None):
     cols = (("id",) if item_id is not None else ()) + ITEM_FIELDS + ("created_at", "updated_at")
-    vals = ([item_id] if item_id is not None else []) + [data[k] for k in ITEM_FIELDS] + [created, updated]
+    vals = ([item_id] if item_id is not None else []) + [data.get(k, ITEM_DEFAULTS.get(k)) for k in ITEM_FIELDS] + [created, updated]
     return db.execute("INSERT INTO items(%s) VALUES (%s)" % (", ".join(cols), ", ".join("?" * len(cols))),
                       vals).lastrowid
 
@@ -658,6 +689,23 @@ def all_items():
     return items
 
 
+def open_dated(items):
+    """Items with each opened pack's expiry brought forward to its "use within N days once opened" date
+    (whichever is sooner), as the app shows it. For working things out; backups keep the printed date."""
+    for it in items:
+        days = it.get("open_days") or 0
+        for b in it["batches"]:
+            if days > 0 and b.get("opened_at"):
+                try:
+                    until = (dt.date.fromisoformat(b["opened_at"][:10]) + dt.timedelta(days=days)).isoformat()
+                except ValueError:
+                    continue
+                if not b["expiry"] or until < b["expiry"]:
+                    b["expiry"] = until
+        it["batches"].sort(key=lambda b: (b.get("opened_at") is None, b["expiry"] is None, b["expiry"] or "", b["id"]))
+    return items
+
+
 LIST_LIMIT = 30  # longest list sent to Home Assistant, to keep its database lean
 
 
@@ -730,12 +778,36 @@ def check_status(c, today):
     return due, days, "Due in %s" % span(days)
 
 
+def lasts_days(lots, per_day, today):
+    """How many days stock lasts, eating whatever goes off first, and how much (in days' worth) goes off before
+    it can be eaten. lots: [(amount, expiry ISO date or None)], amounts in the same units as per_day.
+    Each day's share comes from the batch that goes off soonest; a batch can be eaten up to and including its
+    date, and what's left of it then is wasted. (Eating soonest-first wastes the least.)"""
+    if per_day <= 0:
+        return 0.0, 0.0
+    t = wasted = 0.0
+    for amount, exp in sorted(lots, key=lambda x: (x[1] is None, x[1] or "")):
+        if amount <= 0:
+            continue
+        days = amount / per_day
+        if exp:
+            room = (dt.date.fromisoformat(exp[:10]) - today).days + 1 - t   # days left to eat it in
+            if room <= 0:
+                wasted += days
+                continue
+            if days > room:
+                wasted += days - room
+                days = room
+        t += days
+    return t, wasted
+
+
 def summary():
     """What matters at a glance: the same figures the Sitrep screen shows."""
     today = dt.date.today()
     with LOCK:
         st = get_settings()
-        items = all_items()
+        items = open_dated(all_items())
         extras = [r["text"] for r in DB.execute("SELECT text FROM shopping WHERE done = 0 ORDER BY id")]
         checks = [dict(r) for r in DB.execute("SELECT * FROM checks")]
         warnings = warn_brief()
@@ -746,6 +818,7 @@ def summary():
     pet_water = pets_water(st)
     water_day = people * st["water_per_person"] + pet_water
     kcal = litres = 0.0
+    kcal_lots, litre_lots = [], []
     kit_n, kit_sum = 0, 0.0
     value = cost = 0.0
     priced = 0
@@ -757,7 +830,7 @@ def summary():
         target = it["target_qty"] or 0
         price = it.get("price") or 0
         per_day = it.get("per_day") or 0
-        food = cat == "food" and (it["kcal_per_unit"] or 0) > 0
+        food = cat in KCAL_CATS and (it["kcal_per_unit"] or 0) > 0
         water = cat == "water" and (it["litres_per_unit"] or 0) > 0
         dated = []
         in_date = 0.0
@@ -768,8 +841,10 @@ def summary():
                 in_date += b["qty"]
             if food and fresh:
                 kcal += b["qty"] * it["kcal_per_unit"]
+                kcal_lots.append((b["qty"] * it["kcal_per_unit"], b["expiry"]))
             if water and fresh:
                 litres += b["qty"] * it["litres_per_unit"]
+                litre_lots.append((b["qty"] * it["litres_per_unit"], b["expiry"]))
             if d is not None and b["qty"] > 0:
                 dated.append((d, b))
                 if d >= 0:
@@ -823,8 +898,9 @@ def summary():
                                     "expiry": b0["expiry"], "days": d0, "location": b0["location"] or "",
                                     "text": " · ".join(bits)}))
 
-    food_days = kcal / kcal_day if kcal_day > 0 else 0.0
-    water_days = litres / water_day if water_day > 0 else 0.0
+    # Eaten in date order, a day at a time: food that goes off before you'd get to it doesn't count.
+    food_days, food_waste = lasts_days(kcal_lots, kcal_day, today)
+    water_days, water_waste = lasts_days(litre_lots, water_day, today)
     hold = min(food_days, water_days)
     upcoming.sort(key=lambda x: (x[0], x[1]["name"].lower()))
     nxt = None
@@ -876,6 +952,9 @@ def summary():
         "hold_out_days": _days(hold),
         "food_days": _days(food_days),
         "water_days": _days(water_days),
+        # Days' worth that goes off before it can be eaten (or drunk), eating the soonest first.
+        "food_wasted_days": _days(food_waste),
+        "water_wasted_days": _days(water_waste),
         "runs_out_first": "food" if food_days < water_days else "water" if water_days < food_days else "",
         "kit_stocked_pct": _round(100.0 * kit_sum / kit_n) if kit_n else 0,
         "kit_items": kit_n,
@@ -1093,8 +1172,15 @@ def get_item(db, item_id):
 def snapshot(db, item_id):
     item = dict(get_item(db, item_id))
     batches = [dict(b) for b in db.execute(
-        "SELECT qty, expiry, location, added_at FROM batches WHERE item_id = ? ORDER BY id", (item_id,))]
+        "SELECT qty, expiry, location, added_at, opened_at FROM batches WHERE item_id = ? ORDER BY id", (item_id,))]
     return {"item": item, "batches": batches}
+
+
+def with_barcodes(db, snap):
+    """For deleting an item: its barcodes go with it (ON DELETE CASCADE), and come back with an undo."""
+    snap["barcodes"] = [[r["code"], r["product"], r["added_at"]] for r in db.execute(
+        "SELECT code, product, added_at FROM barcodes WHERE item_id = ?", (snap["item"]["id"],))]
+    return snap
 
 
 def touch(db, item_id):
@@ -1166,6 +1252,10 @@ def api_item_create(body, query):
         if qty > 0:
             db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at) VALUES (?, ?, ?, ?, ?)",
                        (item_id, qty, expiry, location, ts))
+        code = clean_barcode(body.get("barcode"), required=False)
+        if code:   # scanned: next time this barcode goes straight to the item
+            db.execute("INSERT OR REPLACE INTO barcodes(code, item_id, product, added_at) VALUES (?, ?, ?, ?)",
+                       (code, item_id, clean_text(body.get("product"), 160), ts))
         add_log("added", data["name"], ("%s %s" % (fq(qty), data["unit"])).strip() if qty else "New item")
     return {"id": item_id}
 
@@ -1180,6 +1270,9 @@ def api_item_update(body, query, item_id):
         before = get_item(db, item_id)
         if "target_qty" in data and before["auto_target"] and abs(data["target_qty"] - before["target_qty"]) > 1e-9:
             data["auto_target"] = 0   # you've set your own target: it no longer follows the household
+        guessed = [g for g in (before["ai_guessed"] or "").split(",") if g]
+        if guessed:   # a value you've changed by hand isn't an estimate any more
+            data["ai_guessed"] = ",".join(g for g in guessed if g not in data or before[g] == data[g])
         cols = ", ".join("%s = ?" % k for k in data)
         db.execute("UPDATE items SET %s, updated_at = ?, rev = rev + 1 WHERE id = ?" % cols,
                    list(data.values()) + [now_iso(), item_id])
@@ -1191,7 +1284,7 @@ def api_item_update(body, query, item_id):
 def api_item_delete(body, query, item_id):
     item_id = as_int_id(item_id)
     with tx() as db:
-        snap = snapshot(db, item_id)
+        snap = with_barcodes(db, snapshot(db, item_id))
         db.execute("DELETE FROM items WHERE id = ?", (item_id,))
         add_log("removed", snap["item"]["name"], "Item deleted")
         undo_of(db, snap, item_id)
@@ -1224,7 +1317,7 @@ def api_items_delete(body, query):
         for item_id in wanted:
             if not db.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone():
                 continue   # already gone (deleted on another phone)
-            snaps.append(snapshot(db, item_id))
+            snaps.append(with_barcodes(db, snapshot(db, item_id)))
             db.execute("DELETE FROM items WHERE id = ?", (item_id,))
             snaps[-1]["after"] = None
         if not snaps:
@@ -1248,8 +1341,8 @@ def api_stock_add(body, query, item_id):
     with tx() as db:
         item = get_item(db, item_id)
         same = db.execute(
-            "SELECT id FROM batches WHERE item_id = ? AND IFNULL(expiry, '') = ? AND location = ? COLLATE NOCASE",
-            (item_id, expiry or "", location)).fetchone()
+            "SELECT id FROM batches WHERE item_id = ? AND IFNULL(expiry, '') = ? AND location = ? COLLATE NOCASE "
+            "AND opened_at IS NULL", (item_id, expiry or "", location)).fetchone()   # never into an opened pack
         if same:
             db.execute("UPDATE batches SET qty = qty + ? WHERE id = ?", (qty, same["id"]))
         else:
@@ -1263,6 +1356,37 @@ def api_stock_add(body, query, item_id):
     return {"ok": True}
 
 
+def snap_left(left, step=None):
+    """What's left, tidied: a count multipack (6 cans) moves in sixths, so 0.998 is 1 and 0.001 is none."""
+    if step:
+        n = round(left / step)
+        if abs(left - n * step) < 0.02:
+            left = round(n * step, 3)
+    if abs(left - round(left)) < 0.005:
+        left = float(round(left))
+    return max(0.0, left)
+
+
+def settle_batch(db, b, left, step=None):
+    """A batch after some was used. Part of one left means it's been opened: that part becomes its own batch,
+    dated today, so it can go off sooner ("use within 3 days once opened") and is used first."""
+    left = snap_left(left, step)
+    if left <= 0:
+        db.execute("DELETE FROM batches WHERE id = ?", (b["id"],))
+        return
+    whole = math.floor(left + 1e-6)
+    part = round(left - whole, 3)
+    today = dt.date.today().isoformat()
+    if part < 0.001:
+        db.execute("UPDATE batches SET qty = ?, opened_at = NULL WHERE id = ?", (float(whole), b["id"]))
+    elif b["opened_at"] or whole == 0:
+        db.execute("UPDATE batches SET qty = ?, opened_at = IFNULL(opened_at, ?) WHERE id = ?", (left, today, b["id"]))
+    else:
+        db.execute("UPDATE batches SET qty = ? WHERE id = ?", (float(whole), b["id"]))
+        db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at, opened_at) VALUES (?, ?, ?, ?, ?, ?)",
+                   (b["item_id"], part, b["expiry"], b["location"], b["added_at"], today))
+
+
 @route("POST", r"/api/items/(\d+)/use")
 def api_use(body, query, item_id):
     """Use stock, oldest expiry first (first in, first out)."""
@@ -1274,18 +1398,23 @@ def api_use(body, query, item_id):
         snap = snapshot(db, item_id)
         item = snap["item"]
         remaining = qty
-        rows = db.execute("SELECT id, qty FROM batches WHERE item_id = ? AND qty > 0 "
-                          "ORDER BY expiry IS NULL, expiry, id", (item_id,)).fetchall()
+        pk = db.execute("SELECT pack_size, pack_unit FROM items WHERE id = ?", (item_id,)).fetchone()
+        step = 1.0 / pk["pack_size"] if pk and pk["pack_unit"] == "each" and (pk["pack_size"] or 0) >= 2 else None
+        rows = db.execute("SELECT id, item_id, qty, expiry, location, added_at, opened_at FROM batches "
+                          "WHERE item_id = ? AND qty > 0 ORDER BY opened_at IS NULL, expiry IS NULL, expiry, id",
+                          (item_id,)).fetchall()
+        if body.get("batch_id") is not None:
+            # The one in your hand (picked, or matched from a photo of its date): take from that batch first.
+            want = as_int_id(body.get("batch_id"))
+            if not any(r["id"] == want for r in rows):
+                raise ApiError(404, "That batch isn't in this item any more")
+            rows = sorted(rows, key=lambda r: r["id"] != want)
         for b in rows:
             if remaining <= 0:
                 break
             take = min(b["qty"], remaining)
-            left = round(b["qty"] - take, 3)
-            if left <= 0:
-                db.execute("DELETE FROM batches WHERE id = ?", (b["id"],))
-            else:
-                db.execute("UPDATE batches SET qty = ? WHERE id = ?", (left, b["id"]))
-            remaining = round(remaining - take, 3)
+            settle_batch(db, b, round(b["qty"] - take, 3), step)
+            remaining = snap_left(round(remaining - take, 3), step)
         used = round(qty - remaining, 3)
         if used <= 0:
             raise ApiError(409, "There's none of that left to use")
@@ -1401,6 +1530,11 @@ def restore_snapshot(db, snap):
         if col in item:
             v = clean_text(item.get(col), 120) if col == "starter" else (1 if item.get(col) else 0)
             db.execute("UPDATE items SET %s = ? WHERE id = ?" % col, (v, item_id))
+    if not exists and isinstance(snap.get("barcodes"), list):   # undoing a delete: its barcodes come back
+        for c in snap["barcodes"][:200]:
+            if isinstance(c, list) and len(c) == 3 and safe_barcode(c[0]):
+                db.execute("INSERT OR IGNORE INTO barcodes(code, item_id, product, added_at) VALUES (?, ?, ?, ?)",
+                           (safe_barcode(c[0]), item_id, clean_text(c[1], 160), clean_text(c[2], 30) or now_iso()))
     usage = snap.get("usage")
     if isinstance(usage, int) and not isinstance(usage, bool):
         db.execute("DELETE FROM usage WHERE id = ? AND item_id = ?", (usage, item_id))
@@ -1410,10 +1544,965 @@ def restore_snapshot(db, snap):
             continue
         q = clean_num(b.get("qty"), 0, 0, 1e7)
         if q > 0:
-            db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at) VALUES (?, ?, ?, ?, ?)",
+            db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at, opened_at) VALUES (?, ?, ?, ?, ?, ?)",
                        (item_id, q, clean_date(b.get("expiry")), clean_text(b.get("location"), 80),
-                        clean_text(b.get("added_at"), 30) or now_iso()))
+                        clean_text(b.get("added_at"), 30) or now_iso(), clean_date(b.get("opened_at"))))
     return data["name"], True
+
+
+# --------------------------------------------------------------------------
+# Scanning (1.13.0). Barcodes are read on the phone; a new one is looked up in Open Food Facts (only the
+# barcode is sent). Photos of best before dates and labels are read by an AI: Home Assistant's AI Task
+# (whatever AI is set up there), or a provider chosen in HQ with its own key. A photo is only kept for as
+# long as the question takes.
+# --------------------------------------------------------------------------
+OFF_URL = ("https://world.openfoodfacts.org/api/v2/product/%s.json?lc=en&fields=product_name,product_name_en,"
+           "generic_name_en,abbreviated_product_name_en,lang,brands,quantity,product_quantity,product_quantity_unit,"
+           "nutriments,categories_tags")
+OFF_CACHE = {}
+SCAN_DIR = os.environ.get("DADSARMY_MEDIA", "/media/dadsarmy")   # Home Assistant's media folder (mapped in config.yaml)
+AI_PREFER = ("google", "gemini", "anthropic", "claude", "openai", "ollama")
+AI_PROVIDERS = {
+    "ha": {"name": "Home Assistant AI Task", "model": ""},
+    "anthropic": {"name": "Anthropic Claude", "model": "claude-haiku-5-5"},
+    "google": {"name": "Google Gemini", "model": "gemini-flash-latest"},
+    "openai": {"name": "OpenAI", "model": "gpt-4.1-mini"},
+}
+# US dollars per million tokens (in, out), for working out what each call cost. Others aren't priced.
+AI_PRICES = {"claude-haiku-5-5": (0.10, 0.50), "claude-sonnet-5-5": (2.0, 10.0), "claude-opus-5-5": (4.0, 20.0),
+             "claude-haiku-4-5": (1.0, 5.0), "claude-sonnet-5": (2.0, 10.0),
+             # Google's and OpenAI's list prices for the default models, rounded up (check their pricing pages).
+             "gemini-flash-latest": (0.30, 2.50), "gpt-4.1-mini": (0.40, 1.60)}
+# Any other model is costed at this, on the high side, so the monthly limit still stops it.
+AI_PRICE_UNKNOWN = (3.0, 15.0)
+AI_NAMES = (("anthropic", "Claude"), ("claude", "Claude"), ("google", "Gemini"), ("gemini", "Gemini"), ("openai", "OpenAI"))
+
+
+def ai_name(who):
+    return next((n for k, n in AI_NAMES if k in str(who).lower()), "The AI")
+
+
+def friendly_ai_error(who, text):
+    """What went wrong, in plain words: busy, allowance used up, no credit, or the key refused."""
+    t, name = str(text or ""), ai_name(who)
+    low = t.lower()
+    code = lambda n: re.search(r"(?<!\d)%s(?!\d)" % n, t)
+    if "timed out" in low or "timeout" in low:
+        return "%s took too long to answer. Try again." % name
+    if code(503) or code(529) or "high demand" in low or "overloaded" in low or "unavailable" in low:
+        return "%s is busy right now (on their side, not your allowance). Try again in a minute." % name
+    if "insufficient funds" in low or "credit" in low or "billing" in low:
+        return "%s's account has no credit left." % name
+    if code(429) or "quota" in low or "resource_exhausted" in low or "rate limit" in low:
+        return "%s's allowance is used up for now. Try again later, or check your plan." % name
+    if code(401) or code(403) or "api key" in low or "api_key" in low or "authentication" in low or "permission" in low:
+        return "%s didn't accept the API key." % name
+    t = re.sub(r"(sk-|AIza|key[=: ]+)[A-Za-z0-9*_\-]{6,}", r"\1…", t)   # never a key, even a masked one
+    return "%s couldn't answer (%s)" % (name, t[:120])
+
+
+def record_ai(ai, model, task, usage, ok, note=""):
+    tin, tout = int(usage.get("in") or 0), int(usage.get("out") or 0)
+    # Home Assistant's AI Task is paid for there (no token counts come back); direct calls are costed here.
+    price = AI_PRICES.get(model, AI_PRICE_UNKNOWN) if model else None
+    cost = round((tin * price[0] + tout * price[1]) / 1e6, 6) if price else None
+    try:
+        with tx() as db:
+            db.execute("INSERT INTO ai_calls(ts, ai, model, task, tokens_in, tokens_out, cost_usd, ok, note) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (now_iso(), ai, model or "", task, tin, tout, cost, 1 if ok else 0,
+                                                               str(note)[:200]))
+            db.execute("DELETE FROM ai_calls WHERE ts < ?", ((dt.date.today() - dt.timedelta(days=400)).isoformat(),))
+    except Exception:
+        traceback.print_exc()
+    HA_WAKE.set()   # the spend sensor in Home Assistant catches up straight away
+
+
+def month_spend(today=None):
+    today = today or dt.date.today()
+    start = today.replace(day=1).isoformat()
+    row = DB.execute("SELECT COUNT(*), IFNULL(SUM(cost_usd), 0), SUM(ok) FROM ai_calls WHERE ts >= ?", (start,)).fetchone()
+    return {"calls": row[0], "ok": row[2] or 0, "cost_usd": round(row[1], 6), "since": start}
+
+
+AI_TASKS = (("Dads Army best before", "dates"), ("Dads Army label", "labels"), ("Dads Army nutrition", "labels"),
+            ("Dads Army fill in", "filled"))
+
+
+def ai_stats(today=None):
+    """This month, today and last month, and what the AI was used for: for the stats in HQ and Home Assistant."""
+    today = today or dt.date.today()
+    m = month_spend(today)
+    last_start = (today.replace(day=1) - dt.timedelta(days=1)).replace(day=1).isoformat()
+
+    def span(a, b):
+        r = DB.execute("SELECT COUNT(*), IFNULL(SUM(cost_usd), 0), IFNULL(SUM(ok), 0) FROM ai_calls WHERE ts >= ? AND ts < ?",
+                       (a, b)).fetchone()
+        return {"calls": r[0], "ok": r[2], "cost_usd": round(r[1], 6)}
+    tasks = {"dates": 0, "labels": 0, "filled": 0, "other": 0}
+    for r in DB.execute("SELECT task, COUNT(*) FROM ai_calls WHERE ts >= ? AND ok = 1 GROUP BY task", (m["since"],)):
+        tasks[next((k for t, k in AI_TASKS if r[0] == t), "other")] += r[1]
+    tok = DB.execute("SELECT IFNULL(SUM(tokens_in), 0), IFNULL(SUM(tokens_out), 0) FROM ai_calls WHERE ts >= ?", (m["since"],)).fetchone()
+    limit = scan_ai_cfg()["limit_usd"]
+    return dict(m, failed=m["calls"] - m["ok"], tokens_in=tok[0], tokens_out=tok[1], tasks=tasks,
+                avg_usd=round(m["cost_usd"] / m["ok"], 6) if m["ok"] else None,
+                limit_usd=limit, left_usd=round(max(0.0, limit - m["cost_usd"]), 4) if limit else None,
+                today=span(today.isoformat(), (today + dt.timedelta(days=1)).isoformat()),
+                last_month=span(last_start, m["since"]))
+
+
+def ai_limit_check(c):
+    """Stop before a paid call once this month's limit is reached."""
+    limit = float(c.get("limit_usd") or 0)
+    if limit > 0 and month_spend()["cost_usd"] >= limit:
+        nxt = (dt.date.today().replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+        raise ApiError(402, "This month's AI limit ($%.2f) is used up. It starts again on %s, or raise it in HQ → Scanning."
+                       % (limit, nxt.strftime("%-d %B")))
+
+
+DATE_PROMPT = ("Read the best before, best before end or use by date printed on this food or drink packaging. "
+               "Reply with only the date as YYYY-MM-DD. If only a month and year are printed, use the last day of "
+               "that month. If there's no date you can read, reply NONE.")
+LABEL_PROMPT = (
+    "This is a photo of a food, drink or household product, without a readable barcode. Read the packaging and "
+    "reply with only a JSON object, in English (translate if the packaging isn't), with these keys: "
+    '"name" (short product name with brand if shown, e.g. "Heinz Baked Beans"), "size" (pack size as printed, e.g. '
+    '"415 g", or null), "grams" (net weight in grams or volume in millilitres of the WHOLE pack as a number, so '
+    '1980 for 6 x 330 ml, or null), '
+    '"kcal_100g" (energy in kcal per 100 g or 100 ml as a number, or null), "count" (how many in a multipack, e.g. 6 '
+    'for 6 x 330 ml, or null), "category" (one of food, water (plain drinking water only), drinks (juice, milk, '
+    'squash, fizzy drinks), medical, power, cooking, hygiene, tools, comms, '
+    'shelter, docs, pets, other), "unit" (what you count it in: tin, pack, bottle, jar, box, bag, each), '
+    '"best_before" (best before or use by date as YYYY-MM-DD, last day of the month if only month and year, or '
+    "null). Use null for anything you can't read. No other text.")
+
+
+def clean_barcode(v, required=True):
+    v = re.sub(r"\s+", "", str(v or ""))
+    if not v and not required:
+        return ""
+    if not re.fullmatch(r"[0-9]{6,14}", v):
+        raise ApiError(400, "That isn't a product barcode")
+    # One product, one code: a 12-digit UPC-A is the 13-digit EAN with a 0 in front, and a 14-digit
+    # GTIN starting 0 (from a DataBar) is the same 13-digit one.
+    if len(v) == 12:
+        v = "0" + v
+    elif len(v) == 14 and v.startswith("0"):
+        v = v[1:]
+    return v
+
+
+def safe_barcode(v):
+    try:
+        return clean_barcode(v)
+    except ApiError:
+        return None
+
+
+def off_product(code):
+    """Name (in English), size, calories and a category guess for a barcode: from the offline UK list if it's there,
+    otherwise from Open Food Facts online. None if unknown."""
+    if code in OFF_CACHE:
+        return OFF_CACHE[code]
+    local = offline_lookup(code)
+    if local:
+        out = product_from(code, local)
+        out["offline"] = True
+        OFF_CACHE[code] = out
+        return out
+    try:
+        d = json.loads(http_get(OFF_URL % code).decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            OFF_CACHE[code] = None
+            return None
+        raise
+    p = d.get("product") if d.get("product") else None
+    if not p:
+        OFF_CACHE[code] = None
+        return None
+    out = product_from(code, p)
+    OFF_CACHE[code] = out
+    return out
+
+
+def multipack_total(text):
+    """'6 x 330 ml' -> (6, 1980.0): how many, and the whole pack in grams or millilitres. None if it isn't one."""
+    m = re.search(r"(\d{1,3})\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(kg|g|ml|cl|l)\b", str(text or ""), re.I)
+    if not m or int(m.group(1)) < 2:
+        return None
+    each = float(m.group(2).replace(",", ".")) * {"kg": 1000, "g": 1, "ml": 1, "cl": 10, "l": 1000}[m.group(3).lower()]
+    return int(m.group(1)), each * int(m.group(1))
+
+
+DRINK_TAGS = r"beverages|juices|sodas|soft-drinks|milks|smoothies|plant-based-milks"
+
+
+def product_from(code, p):
+    """An Open Food Facts product (online JSON, or a row of the offline list) shaped for Dads Army."""
+    english = (p.get("product_name_en") or p.get("abbreviated_product_name_en") or p.get("generic_name_en") or "").strip()
+    name = english or (p.get("product_name") or "").strip()
+    if name and not english and str(p.get("lang") or "en") != "en":
+        name = translate_name(name) or name   # e.g. a German product: ask the AI for the English
+    brand = (p.get("brands") or "").split(",")[0].strip()
+    qty_text = (p.get("quantity") or "").strip()
+    grams = None
+    try:
+        if p.get("product_quantity") and str(p.get("product_quantity_unit") or "g").lower() in ("g", "ml"):
+            grams = float(p["product_quantity"])
+    except (TypeError, ValueError):
+        grams = None
+    # A multipack ("6 x 330 ml"): calories and size are for the whole pack, as that's what's counted.
+    # Open Food Facts sometimes gives one can's weight; the printed quantity says what the pack holds.
+    multi = multipack_total(qty_text)
+    if multi and (not grams or grams < multi[1] * 0.9):
+        grams = multi[1]
+    kcal100 = (p.get("nutriments") or {}).get("energy-kcal_100g")
+    try:
+        kcal = round(float(kcal100) * grams / 100.0) if kcal100 is not None and grams else 0
+    except (TypeError, ValueError):
+        kcal = 0
+    tags = " ".join(p.get("categories_tags") or [])
+    mcount = re.match(r"^\s*(\d{1,3})\s*[x×]\s*", qty_text, re.I)
+    count = int(mcount.group(1)) if mcount and int(mcount.group(1)) > 1 else 0
+    drink = re.search(r"waters|bottled-water|mineral-water", tags)
+    juice = not drink and re.search(DRINK_TAGS, tags)
+    full = (brand + " " if brand and brand.lower() not in name.lower() else "") + name
+    out = {"code": code, "name": (full + (" (%s)" % qty_text if qty_text else "")).strip()[:120] or code,
+           "brand": brand, "quantity": qty_text, "grams": grams, "kcal_per_unit": kcal,
+           "kcal_100g": kcal100, "category": "water" if drink else "drinks" if juice else "food", "count": count,
+           "litres_per_unit": round(grams / 1000.0, 2) if drink and grams else 0,
+           "unit": "pack" if count else "bottle" if drink or juice else ("tin" if re.search(r"canned|tinned", tags) else "pack")}
+    if drink:
+        out["kcal_per_unit"] = 0
+    return out
+
+
+def scan_ai_cfg():
+    """{"provider", "model", "keys": {provider: key}}: kept apart from the household settings, so never in backups."""
+    raw = setting_raw("scan_ai", {}) or {}
+    prov = raw.get("provider") if raw.get("provider") in AI_PROVIDERS else "ha"
+    keys = dict((k, v) for k, v in (raw.get("keys") or {}).items() if k in AI_PROVIDERS and isinstance(v, str) and v)
+    return {"provider": prov, "model": str(raw.get("model") or ""), "keys": keys, "limit_usd": float(raw.get("limit_usd") or 0)}
+
+
+def sweep_scan_photos():
+    """Photos are deleted once the AI has read them; one left by a restart mid-question goes now."""
+    try:
+        for n in os.listdir(SCAN_DIR):
+            if n.startswith("scan-") and n.endswith(".jpg"):
+                os.remove(os.path.join(SCAN_DIR, n))
+    except OSError:
+        pass
+
+
+def ai_task_entities():
+    """Home Assistant's AI Task entities, the one chosen first, then Gemini, Claude, OpenAI."""
+    if not HA_TOKEN:
+        return []
+    status, out = ha_request("GET", "/states", timeout=15)
+    ents = [st["entity_id"] for st in out if isinstance(st, dict) and str(st.get("entity_id", "")).startswith("ai_task.")
+            and st.get("state") != "unavailable"] if status == 200 and isinstance(out, list) else []
+
+    def rank(e):
+        return next((i for i, w in enumerate(AI_PREFER) if w in e), len(AI_PREFER))
+    return sorted(ents, key=rank)
+
+
+def _post_json(url, body, headers, timeout=60):
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
+                                 headers=dict({"Content-Type": "application/json", "User-Agent": FEED_UA}, **headers))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode("utf-8"))
+            msg = (err.get("error") or {}).get("message") if isinstance(err.get("error"), dict) else err.get("error") or err.get("message")
+        except Exception:
+            msg = ""
+        raise IOError("HTTP %d%s" % (e.code, (": " + str(msg)[:120]) if msg else ""))
+
+
+def ai_direct(provider, key, model, prompt, img_b64=None, usage=None):
+    """Ask one provider directly, with an optional JPEG. Returns the model's reply text; tokens go in `usage`."""
+    usage = usage if usage is not None else {}
+    if provider == "anthropic":
+        # Messages API over plain HTTPS (the add-on is standard library only, so no SDK).
+        content = ([{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}}]
+                   if img_b64 else []) + [{"type": "text", "text": prompt}]
+        out = _post_json("https://api.anthropic.com/v1/messages", {
+            "model": model or AI_PROVIDERS["anthropic"]["model"], "max_tokens": 2048,
+            "output_config": {"effort": "low"},
+            "messages": [{"role": "user", "content": content}]},
+            {"x-api-key": key, "anthropic-version": "2026-10-21"})
+        u = out.get("usage") or {}
+        usage.update({"in": u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0), "out": u.get("output_tokens", 0)})
+        if out.get("stop_reason") == "refusal":
+            raise IOError("Claude declined to read it")
+        return " ".join(b.get("text", "") for b in out.get("content") or [] if b.get("type") == "text")
+    if provider == "google":
+        parts = ([{"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}] if img_b64 else []) + [{"text": prompt}]
+        out = _post_json("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" %
+                         urllib.parse.quote(model or AI_PROVIDERS["google"]["model"]), {"contents": [{"parts": parts}]},
+                         {"x-goog-api-key": key})
+        u = out.get("usageMetadata") or {}
+        usage.update({"in": u.get("promptTokenCount", 0), "out": u.get("candidatesTokenCount", 0)})
+        return " ".join(p.get("text", "") for c in out.get("candidates") or [] for p in (c.get("content") or {}).get("parts") or [])
+    if provider == "openai":
+        content = [{"type": "text", "text": prompt}] + ([{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + img_b64}}]
+                                                       if img_b64 else [])
+        out = _post_json("https://api.openai.com/v1/chat/completions", {
+            "model": model or AI_PROVIDERS["openai"]["model"], "messages": [{"role": "user", "content": content}]},
+            {"Authorization": "Bearer " + key})
+        u = out.get("usage") or {}
+        usage.update({"in": u.get("prompt_tokens", 0), "out": u.get("completion_tokens", 0)})
+        return ((out.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    raise ValueError("Unknown provider")
+
+
+def read_date_direct(provider, key, model, img_b64):
+    return ai_direct(provider, key, model, DATE_PROMPT, img_b64)
+
+
+def ai_ask(prompt, img=None, task="Dads Army"):
+    """Ask whichever AI is chosen in HQ → Scanning. Returns (reply text, which AI)."""
+    c = scan_ai_cfg()
+    if c["provider"] != "ha":
+        key = c["keys"].get(c["provider"])
+        if not key:
+            raise ApiError(400, "Add your %s API key in HQ → Scanning" % AI_PROVIDERS[c["provider"]]["name"])
+        ai_limit_check(c)
+        model = c["model"] or AI_PROVIDERS[c["provider"]]["model"]
+        for attempt in (1, 2):
+            usage = {}
+            try:
+                reply = ai_direct(c["provider"], key, c["model"], prompt, base64.b64encode(img).decode("ascii") if img else None, usage)
+                record_ai(c["provider"], model, task, usage, True)
+                return reply, c["provider"]
+            except (urllib.error.URLError, IOError, ValueError) as e:
+                msg = str(getattr(e, "reason", e))
+                record_ai(c["provider"], model, task, usage, False, friendly_ai_error(c["provider"], msg))
+                if attempt == 1 and ("503" in msg or "529" in msg or "overloaded" in msg.lower()):
+                    time.sleep(2)   # busy: one more go
+                    continue
+                raise ApiError(502, friendly_ai_error(c["provider"], msg))
+    ents = ai_task_entities()
+    if not ents:
+        raise ApiError(400, "Set up an AI in Home Assistant, or add an API key in HQ → Scanning")
+    path = name = None
+    if img:
+        os.makedirs(SCAN_DIR, exist_ok=True)
+        name = "scan-%s.jpg" % uuid.uuid4().hex
+        path = os.path.join(SCAN_DIR, name)
+        with open(path, "wb") as f:
+            f.write(img)
+    errors = []
+    try:
+        for ent in ents[:3]:
+            req = {"task_name": task, "entity_id": ent, "instructions": prompt}
+            if name:
+                req["attachments"] = [{"media_content_id": "media-source://media_source/local/%s/%s" % (os.path.basename(SCAN_DIR), name),
+                                       "media_content_type": "image/jpeg"}]
+            for attempt in (1, 2):
+                status, out = ha_request("POST", "/services/ai_task/generate_data?return_response", req, timeout=60)
+                if status == 200 and isinstance(out, dict):
+                    record_ai(ent, "", task, {}, True)
+                    return str((out.get("service_response") or {}).get("data") or ""), ent
+                msg = (out.get("message") if isinstance(out, dict) else str(out or status)) or str(status)
+                record_ai(ent, "", task, {}, False, friendly_ai_error(ent, msg))
+                if attempt == 1 and ("503" in msg or "high demand" in msg.lower() or "overloaded" in msg.lower()):
+                    time.sleep(2)   # busy: one more go before trying the next AI
+                    continue
+                break
+            errors.append(friendly_ai_error(ent, msg))
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    raise ApiError(502, " ".join(errors)[:300])
+
+
+def translate_name(name):
+    """A product name in English, via the chosen AI. None if there's no AI or it can't."""
+    try:
+        reply, _ai = ai_ask("Translate this food or household product name into short, natural UK English. Keep the "
+                            "brand name as it is. Reply with only the translated name.\n\n" + name[:200], None,
+                            "Dads Army translate")
+    except ApiError:
+        return None
+    t = clean_text(str(reply or "").strip().strip('"').splitlines()[0] if reply else "", 100)
+    return t or None
+
+
+def read_date_reply(text):
+    """'2027-03-31' (or that inside other words) to an ISO date; None for NONE or nonsense."""
+    m = re.search(r"(20\d\d)-(\d\d)-(\d\d)", str(text or ""))
+    if not m:
+        return None
+    try:
+        d = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+    return d.isoformat() if dt.date(2000, 1, 1) <= d <= dt.date(2100, 1, 1) else None
+
+
+def parse_label_reply(text):
+    """The AI's JSON (possibly wrapped in words or a code fence) to a product, or None."""
+    m = re.search(r"\{.*\}", str(text or ""), re.S)
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group(0))
+    except ValueError:
+        return None
+    if not isinstance(d, dict) or not str(d.get("name") or "").strip():
+        return None
+
+    def number(v):
+        try:
+            f = float(v)
+            return f if 0 < f < 100000 else None
+        except (TypeError, ValueError):
+            return None
+    grams, kcal100, count = number(d.get("grams")), number(d.get("kcal_100g")), number(d.get("count"))
+    catg = d.get("category") if d.get("category") in CATEGORIES else "food"
+    size = clean_text(d.get("size"), 30) if d.get("size") else ""
+    multi = multipack_total(size)
+    if multi and (not grams or grams < multi[1] * 0.9):
+        grams = multi[1]   # the whole pack, not one can
+    name = clean_text(d.get("name"), 100)
+    unit = clean_text(d.get("unit"), 20).lower() if d.get("unit") else ""
+    return {"code": "", "count": int(count) if count and count > 1 and count == int(count) else 0,
+            "name": (name + (" (%s)" % size if size and size.lower() not in name.lower() else "")).strip(),
+            "brand": "", "quantity": size, "grams": grams, "kcal_100g": kcal100,
+            "kcal_per_unit": round(kcal100 * grams / 100.0) if catg in KCAL_CATS + ("pets",) and kcal100 and grams else 0,
+            "litres_per_unit": round(grams / 1000.0, 2) if catg == "water" and grams else 0,
+            "category": catg, "unit": unit if re.fullmatch(r"[a-z]{2,12}", unit) else ("bottle" if catg == "water" else "pack"),
+            "expiry": read_date_reply(d.get("best_before")) if d.get("best_before") else None, "from_ai": True}
+
+
+def photo_from(body):
+    raw = str(body.get("image") or "")
+    if raw.startswith("data:"):
+        raw = raw.split(",", 1)[-1]
+    try:
+        img = base64.b64decode(raw, validate=True)
+    except (ValueError, TypeError):
+        raise ApiError(400, "That isn't a photo")
+    if not img.startswith(b"\xff\xd8") or len(img) > 3000000:
+        raise ApiError(400, "Send a JPEG photo under 3 MB")
+    return img
+
+
+# --------------------------------------------------------------------------
+# The offline barcode list: every product Open Food Facts lists as sold in the UK (about 200,000), kept on the
+# Pi so scanning works with the internet down. Built from Open Food Facts' public export (about 1.5 GB,
+# compressed), read as it downloads, once a month at night and whenever asked. Kept in its own small database
+# beside Dads Army's, left out of Home Assistant backups (config.yaml), as it can always be downloaded again.
+# Data © Open Food Facts contributors, under the Open Database Licence.
+# --------------------------------------------------------------------------
+OFFLINE_URL = os.environ.get("DADSARMY_OFF_EXPORT", "https://static.openfoodfacts.org/data/en.openfoodfacts.org.products.csv.gz")
+OFFLINE_EVERY_DAYS = 30
+OFFLINE_HOURS = (2, 5)   # build between 2 and 5 in the morning, when no one's scanning
+OFFLINE = {"building": False, "read_mb": 0, "total_mb": 0, "rows": 0, "kept": 0, "conn": None, "path": None}
+OFFLINE_LOCK = threading.Lock()
+OFFLINE_COLS = ("code", "product_name", "brands", "quantity", "product_quantity", "energy-kcal_100g",
+                "categories_tags", "countries_en")
+
+
+def offline_cfg():
+    try:
+        c = (setting_raw("offline_barcodes", {}) or {}) if DB is not None else {}
+    except sqlite3.Error:   # no database (yet): off
+        c = {}
+    return {"enabled": bool(c.get("enabled")), "built_at": c.get("built_at"), "count": int(c.get("count") or 0),
+            "error": str(c.get("error") or ""), "tried_at": c.get("tried_at")}
+
+
+def offline_save(**kw):
+    c = setting_raw("offline_barcodes", {}) or {}
+    c.update(kw)
+    with tx() as db:
+        set_setting_raw(db, "offline_barcodes", c)
+
+
+def offline_db():
+    return os.path.join(DATA_DIR, "barcodes_uk.db")
+
+
+def offline_conn():
+    with OFFLINE_LOCK:
+        if OFFLINE["conn"] is not None and OFFLINE["path"] != offline_db():
+            OFFLINE["conn"].close()
+            OFFLINE["conn"] = None
+        if OFFLINE["conn"] is None and os.path.exists(offline_db()):
+            try:
+                OFFLINE["conn"] = sqlite3.connect("file:%s?mode=ro" % offline_db(), uri=True, check_same_thread=False)
+                OFFLINE["path"] = offline_db()
+            except sqlite3.Error:
+                OFFLINE["conn"] = None
+        return OFFLINE["conn"]
+
+
+def offline_lookup(code):
+    """The offline list's row for a barcode (as an Open Food Facts product), or None."""
+    if not offline_cfg()["enabled"]:
+        return None
+    conn = offline_conn()
+    if conn is None:
+        return None
+    codes = [code] + ([code.zfill(13)] if len(code) < 13 else []) + ([code.lstrip("0")] if code.startswith("0") else [])
+    try:
+        with OFFLINE_LOCK:
+            row = None
+            for c in codes:
+                row = conn.execute("SELECT name, brand, quantity, grams, kcal100, cats FROM products WHERE code = ?", (c,)).fetchone()
+                if row:
+                    break
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    return {"product_name": row[0], "brands": row[1], "quantity": row[2], "product_quantity": row[3],
+            "product_quantity_unit": "g", "nutriments": {"energy-kcal_100g": row[4]},
+            "categories_tags": (row[5] or "").split(","), "lang": "en"}
+
+
+class _Counted(object):
+    """A file that counts what's been read from it (for progress)."""
+    def __init__(self, f):
+        self.f, self.n = f, 0
+
+    def read(self, size=-1):
+        b = self.f.read(size)
+        self.n += len(b)
+        OFFLINE["read_mb"] = round(self.n / 1048576.0)
+        return b
+
+    def readable(self):
+        return True
+
+
+def build_offline(url=None):
+    """Download the export, keep the UK products, and swap the new list in. Runs on its own thread."""
+    with OFFLINE_LOCK:
+        if OFFLINE["building"]:
+            return False
+        OFFLINE.update(building=True, read_mb=0, total_mb=0, rows=0, kept=0)
+    tmp = offline_db() + ".new"
+    try:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        out = sqlite3.connect(tmp)
+        out.execute("PRAGMA journal_mode = OFF")
+        out.execute("PRAGMA synchronous = OFF")
+        out.execute("CREATE TABLE products (code TEXT PRIMARY KEY, name TEXT, brand TEXT, quantity TEXT, grams REAL, "
+                    "kcal100 REAL, cats TEXT)")
+        req = urllib.request.Request(url or OFFLINE_URL, headers={"User-Agent": FEED_UA})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            OFFLINE["total_mb"] = round(int(r.headers.get("Content-Length") or 0) / 1048576.0)
+            raw = _Counted(r)
+            text = io.TextIOWrapper(gzip.GzipFile(fileobj=raw), encoding="utf-8", errors="replace", newline="\n")
+            head = text.readline().rstrip("\n").split("\t")
+            try:
+                ix = dict((c, head.index(c)) for c in OFFLINE_COLS)
+            except ValueError as e:
+                raise ValueError("Open Food Facts changed its export (%s)" % e)
+            width, batch = len(head), []
+            ci = ix["countries_en"]
+            for line in text:
+                OFFLINE["rows"] += 1
+                if "United Kingdom" not in line:
+                    continue
+                f = line.rstrip("\n").split("\t")
+                if len(f) != width or "United Kingdom" not in f[ci]:
+                    continue
+                code = f[ix["code"]].strip()
+                name = f[ix["product_name"]].strip()
+                if not name or not re.fullmatch(r"[0-9]{6,14}", code):
+                    continue
+
+                def num(v):
+                    try:
+                        x = float(v)
+                        return x if 0 < x < 100000 else None
+                    except ValueError:
+                        return None
+                batch.append((code, name[:120], f[ix["brands"]].strip()[:80], f[ix["quantity"]].strip()[:40],
+                              num(f[ix["product_quantity"]]), num(f[ix["energy-kcal_100g"]]),
+                              f[ix["categories_tags"]][:400]))
+                if len(batch) >= 5000:
+                    out.executemany("INSERT OR REPLACE INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
+                    OFFLINE["kept"] += len(batch)
+                    batch = []
+                    if not offline_cfg()["enabled"]:
+                        raise ValueError("switched off while updating")
+            if batch:
+                out.executemany("INSERT OR REPLACE INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
+                OFFLINE["kept"] += len(batch)
+        out.commit()
+        count = out.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        out.close()
+        if count < 1000:
+            raise ValueError("only %d UK products came through, so the old list was kept" % count)
+        with OFFLINE_LOCK:
+            if OFFLINE["conn"] is not None:
+                OFFLINE["conn"].close()
+                OFFLINE["conn"] = None
+            os.replace(tmp, offline_db())
+        OFF_CACHE.clear()
+        offline_save(built_at=now_iso(), count=count, error="", tried_at=now_iso())
+        add_log("settings", "", "Offline barcode list updated: %d UK products" % count)
+        return True
+    except Exception as e:
+        offline_save(error=str(getattr(e, "reason", e))[:200], tried_at=now_iso())
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    finally:
+        OFFLINE["building"] = False
+
+
+def offline_due(c, now=None):
+    now = now or dt.datetime.now()
+    if not c["enabled"] or OFFLINE["building"]:
+        return False
+    if c["tried_at"] and (now - dt.datetime.fromisoformat(c["tried_at"][:19])).total_seconds() < 20 * 3600:
+        return False   # tried in the last day (and maybe failed): not again yet
+    if not c["built_at"]:
+        return True
+    old = (now - dt.datetime.fromisoformat(c["built_at"][:19])).days >= OFFLINE_EVERY_DAYS
+    return old and OFFLINE_HOURS[0] <= now.hour < OFFLINE_HOURS[1]
+
+
+def offline_loop():
+    while True:
+        try:
+            if offline_due(offline_cfg()):
+                build_offline()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(600)
+
+
+def offline_status():
+    c = offline_cfg()
+    size = os.path.getsize(offline_db()) if os.path.exists(offline_db()) else 0
+    return dict(c, building=OFFLINE["building"], read_mb=OFFLINE["read_mb"], total_mb=OFFLINE["total_mb"],
+                kept=OFFLINE["kept"], size_mb=round(size / 1048576.0, 1))
+
+
+@route("GET", "/api/scan/offline")
+def api_scan_offline(body, query):
+    return offline_status()
+
+
+@route("PUT", "/api/scan/offline")
+def api_scan_offline_set(body, query):
+    if body.get("enabled") not in (True, False):
+        raise ApiError(400, "Say on or off")
+    offline_save(enabled=bool(body["enabled"]), tried_at=None if body["enabled"] else offline_cfg()["tried_at"])
+    if body["enabled"] and not offline_cfg()["built_at"]:
+        threading.Thread(target=build_offline, name="offline-barcodes", daemon=True).start()   # the first one now
+    add_log("settings", "", "Offline barcode list %s" % ("on" if body["enabled"] else "off"))
+    return offline_status()
+
+
+@route("POST", "/api/scan/offline/update")
+def api_scan_offline_update(body, query):
+    if not offline_cfg()["enabled"]:
+        raise ApiError(400, "Switch the offline list on first")
+    if not OFFLINE["building"]:
+        threading.Thread(target=build_offline, name="offline-barcodes", daemon=True).start()
+    return dict(offline_status(), building=True)
+
+
+@route("GET", "/api/scan/barcode")
+def api_scan_barcode(body, query):
+    code = clean_barcode((query.get("code") or [""])[0])
+    with LOCK:
+        row = DB.execute("SELECT item_id, product FROM barcodes WHERE code = ?", (code,)).fetchone()
+    if row:
+        return {"code": code, "item_id": row["item_id"], "product": {"name": row["product"]} if row["product"] else None}
+    try:
+        product = off_product(code)
+    except (urllib.error.URLError, IOError, ValueError) as e:
+        return {"code": code, "item_id": None, "product": None, "lookup_error": str(getattr(e, "reason", e))[:120]}
+    return {"code": code, "item_id": None, "product": product}
+
+
+@route("POST", "/api/scan/link")
+def api_scan_link(body, query):
+    """This barcode is this item from now on (another brand of baked beans goes on the same line)."""
+    code = clean_barcode(body.get("code"))
+    item_id = as_int_id(body.get("item_id"))
+    with tx() as db:
+        if not db.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone():
+            raise ApiError(404, "That item doesn't exist")
+        db.execute("INSERT OR REPLACE INTO barcodes(code, item_id, product, added_at) VALUES (?, ?, ?, ?)",
+                   (code, item_id, clean_text(body.get("product"), 160), now_iso()))
+    return {"ok": True}
+
+
+@route("POST", "/api/scan/date")
+def api_scan_date(body, query):
+    """Read the best before date from a photo."""
+    reply, ai = ai_ask(DATE_PROMPT, photo_from(body), "Dads Army best before")
+    return {"date": read_date_reply(reply), "reply": str(reply or "")[:40], "ai": ai}
+
+
+# --------------------------------------------------------------------------
+# Filling in what's missing (1.13.0): calories for a whole pack, what one holds, and how long it keeps once
+# opened, estimated by the AI from the name, for you to check. Nothing is saved until you say so, and what
+# was estimated is marked until you change it.
+# --------------------------------------------------------------------------
+FILL_MAX = 40
+NO_KCAL_RE = re.compile(r"\b(tea|coffee|salt|stock|spice|herb|pepper|water|vinegar|yeast|baking)\b", re.I)
+
+
+def fill_wanted(it):
+    """The fields worth estimating for an item: [] if it has what it needs."""
+    cat = it["category"]
+    if cat not in KCAL_CATS + ("pets",):
+        return []
+    want = []
+    if not (it["kcal_per_unit"] or 0) > 0 and not NO_KCAL_RE.search(it["name"]):
+        want.append("kcal_per_unit")
+    if not (it["pack_size"] or 0) > 0:
+        want.append("pack_size")
+    if not (it["open_days"] or 0) > 0 and cat in KCAL_CATS:
+        want.append("open_days")
+    return want
+
+
+FILL_PROMPT = (
+    "These are items in a UK household's emergency food stores. For each one, estimate what's missing, from the "
+    "name and unit, using typical UK supermarket products. Reply with only a JSON array, one object per item, with "
+    '"id" and only the keys asked for: "kcal_per_unit" (energy in kcal for ONE WHOLE unit as counted, e.g. a whole '
+    "400 g tin of baked beans is about 320, a 1 kg bag of rice about 3600, a pack of 6 cans is all six), "
+    '"pack_size" and "pack_unit" (what one unit holds: pack_unit one of g, kg, ml, l, each; "each" with a count for '
+    'a multipack), "open_days" (days it keeps once opened, stored as the label says: an open tin about 3, an open '
+    "jar of jam about 30, dry pasta about 365). Use null if you can't tell. No other text.\n\n")
+
+
+def parse_fill_reply(text, asked):
+    """The AI's JSON array to {id: {field: value}}, keeping only fields asked for, with sane values."""
+    m = re.search(r"\[.*\]", str(text or ""), re.S)
+    try:
+        rows = json.loads(m.group(0)) if m else []
+    except ValueError:
+        rows = []
+    out = {}
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            iid = int(r.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if iid not in asked:
+            continue
+        got = {}
+        for f, lo, hi in (("kcal_per_unit", 1, 100000), ("pack_size", 0.01, 100000), ("open_days", 1, 3650)):
+            if f not in asked[iid]:
+                continue
+            try:
+                v = float(r.get(f))
+            except (TypeError, ValueError):
+                continue
+            if lo <= v <= hi:
+                got[f] = round(v) if f != "pack_size" else round(v, 2)
+        if "pack_size" in got:
+            u = str(r.get("pack_unit") or "").lower()
+            if u in PACK_UNITS:
+                got["pack_unit"] = u
+            else:
+                got.pop("pack_size")
+        if got:
+            out[iid] = got
+    return out
+
+
+@route("POST", "/api/ai/fill")
+def api_ai_fill(body, query):
+    """Estimates for what's missing, for you to check. Nothing is saved here."""
+    with LOCK:
+        items = [dict(r) for r in DB.execute("SELECT id, name, category, unit, kcal_per_unit, pack_size, pack_unit, "
+                                             "open_days FROM items ORDER BY name COLLATE NOCASE")]
+    only = body.get("ids")
+    if isinstance(only, list):
+        keep = set(as_int_id(i) for i in only[:FILL_MAX])
+        items = [it for it in items if it["id"] in keep]
+    asked = {}
+    lines = []
+    for it in items:
+        want = fill_wanted(it)
+        if want and len(asked) < FILL_MAX:
+            asked[it["id"]] = want
+            lines.append(json.dumps({"id": it["id"], "name": it["name"], "unit": it["unit"] or "", "category": it["category"],
+                                     "asked": [w for w in want], "known": {k: it[k] for k in ("pack_size", "pack_unit")
+                                                                          if it[k] and "pack_size" not in want}}))
+    if not asked:
+        return {"suggestions": [], "left": 0}
+    reply, _ai = ai_ask(FILL_PROMPT + "\n".join(lines), None, "Dads Army fill in")
+    got = parse_fill_reply(reply, asked)
+    names = dict((it["id"], it) for it in items)
+    left = sum(1 for it in items if fill_wanted(it)) - len(asked)
+    return {"suggestions": [{"id": i, "name": names[i]["name"], "unit": names[i]["unit"], "fields": f}
+                            for i, f in got.items()], "left": max(0, left)}
+
+
+@route("POST", "/api/ai/fill/apply")
+def api_ai_fill_apply(body, query):
+    """Save the estimates you kept, marked as estimated until you change them."""
+    rows = body.get("items")
+    if not isinstance(rows, list) or not rows or len(rows) > 200:
+        raise ApiError(400, "Nothing to save")
+    n = 0
+    with tx() as db:
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            iid = as_int_id(r.get("id"))
+            if not db.execute("SELECT 1 FROM items WHERE id = ?", (iid,)).fetchone():
+                continue
+            data = clean_item(dict((k, r[k]) for k in ("kcal_per_unit", "pack_size", "pack_unit", "open_days") if k in r),
+                              partial=True)
+            if not data:
+                continue
+            old = db.execute("SELECT ai_guessed FROM items WHERE id = ?", (iid,)).fetchone()["ai_guessed"]
+            guessed = sorted(set(filter(None, old.split(","))) | set(k for k in data if k != "pack_unit"))
+            cols = ", ".join("%s = ?" % k for k in data)
+            db.execute("UPDATE items SET %s, ai_guessed = ?, updated_at = ?, rev = rev + 1 WHERE id = ?" % cols,
+                       list(data.values()) + [",".join(guessed), now_iso(), iid])
+            n += 1
+        if n:
+            add_log("edited", "%d item%s" % (n, "" if n == 1 else "s"), "Details filled in by the AI")
+    return {"saved": n}
+
+
+# --------------------------------------------------------------------------
+# The nutrition panel (1.13.0): calories for the whole pack from a photo of the back, for something already in
+# Open Food Facts without calories, or already in the stores. Read from the label, so it's not an estimate.
+# --------------------------------------------------------------------------
+NUTRITION_PROMPT = (
+    "This is a photo of the nutrition information (and maybe the weight) on a food or drink pack. Reply with only "
+    "a JSON object with these keys: \"kcal_100g\" (energy in kcal per 100 g or per 100 ml as a number: use the "
+    "kcal figure, not kJ; if only kJ is printed, divide by 4.184), \"grams\" (net weight or volume of the WHOLE pack "
+    "in grams or millilitres, if printed anywhere in the photo, e.g. 1980 for 6 x 330 ml, or null), \"count\" (how "
+    "many in a multipack, or null), \"kcal_pack\" (kcal for the whole pack if printed, or null), "
+    "\"serving_g\" and \"kcal_serving\" (a serving's size and kcal, if printed, or null). Use null for anything "
+    "you can't read. No other text.")
+
+
+def _lnum(v, lo=0, hi=100000):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if lo < f < hi else None
+
+
+def parse_nutrition_reply(text, grams=None, count=None):
+    """The AI's reading, plus what's known about the pack, to calories for one whole unit, with the working out.
+    grams: what one unit weighs, if the item already says (the label's own figure wins)."""
+    m = re.search(r"\{.*\}", str(text or ""), re.S)
+    try:
+        d = json.loads(m.group(0)) if m else None
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        return None
+    k100 = _lnum(d.get("kcal_100g"), 0, 1000)
+    g = _lnum(d.get("grams")) or grams
+    n = _lnum(d.get("count"), 1, 1000)
+    kpack = _lnum(d.get("kcal_pack"))
+    out = {"kcal_100g": k100, "grams": g, "count": int(n) if n and n == int(n) else None,
+           "serving_g": _lnum(d.get("serving_g")), "kcal_serving": _lnum(d.get("kcal_serving"))}
+    if k100 and g:
+        out["kcal_per_unit"] = int(round(k100 * g / 100.0))
+        out["how"] = "%s kcal per 100 g × %s g = %s kcal" % (fq(k100), fq(g), out["kcal_per_unit"])
+    elif kpack:
+        out["kcal_per_unit"] = int(round(kpack))
+        out["how"] = "%s kcal for the whole pack, as printed" % fq(kpack)
+    elif k100:
+        out["kcal_per_unit"] = None
+        out["how"] = "%s kcal per 100 g: add the weight of the whole pack to work out the total" % fq(k100)
+    else:
+        return None
+    return out
+
+
+@route("POST", "/api/scan/nutrition")
+def api_scan_nutrition(body, query):
+    """Calories for one whole unit from a photo of the nutrition panel. grams: what one weighs, if known."""
+    grams = _lnum(body.get("grams"))
+    reply, ai = ai_ask(NUTRITION_PROMPT, photo_from(body), "Dads Army nutrition")
+    got = parse_nutrition_reply(reply, grams)
+    if not got:
+        raise ApiError(422, "Couldn't read the calories in that photo. Try the nutrition table, closer up and flat on.")
+    return dict(got, ai=ai)
+
+
+@route("POST", "/api/scan/label")
+def api_scan_label(body, query):
+    """No barcode: read the name, size, calories and date from the label."""
+    reply, ai = ai_ask(LABEL_PROMPT, photo_from(body), "Dads Army label")
+    product = parse_label_reply(reply)
+    if not product:
+        raise ApiError(422, "Couldn't make out the product from that photo. Try the front of the pack, closer up.")
+    return {"product": product, "ai": ai}
+
+
+@route("GET", "/api/scan/ai")
+def api_scan_ai_get(body, query):
+    c = scan_ai_cfg()
+    try:
+        ents = ai_task_entities()
+    except Exception:
+        ents = []
+    recent = [dict(r) for r in DB.execute("SELECT ts, ai, model, task, tokens_in, tokens_out, cost_usd, ok, note FROM ai_calls "
+                                          "ORDER BY id DESC LIMIT 15")]
+    return {"provider": c["provider"], "model": c["model"], "keys_set": sorted(c["keys"]), "ha_entities": ents,
+            "limit_usd": c["limit_usd"], "month": month_spend(), "stats": ai_stats(), "recent": recent,
+            "providers": dict((k, {"name": v["name"], "model": v["model"]}) for k, v in AI_PROVIDERS.items())}
+
+
+@route("PUT", "/api/scan/ai")
+def api_scan_ai_put(body, query):
+    raw = setting_raw("scan_ai", {}) or {}
+    raw.setdefault("keys", {})
+    if "provider" in body:
+        if body["provider"] not in AI_PROVIDERS:
+            raise ApiError(400, "Choose Home Assistant, Anthropic, Google or OpenAI")
+        raw["provider"] = body["provider"]
+    if "model" in body:
+        m = clean_text(body.get("model"), 80)
+        if m and not re.fullmatch(r"[A-Za-z0-9._:/-]+", m):
+            raise ApiError(400, "That isn't a model name")
+        raw["model"] = m
+    if "limit_usd" in body:
+        raw["limit_usd"] = round(clean_num(body.get("limit_usd"), 0, 0, 1000, "Monthly limit"), 2)
+    for prov in ("anthropic", "google", "openai"):
+        k = "key_" + prov
+        if k in body:
+            v = str(body.get(k) or "").strip()
+            if v and not re.fullmatch(r"[A-Za-z0-9_\-.]{20,300}", v):
+                raise ApiError(400, "That doesn't look like an API key")
+            if v:
+                raw["keys"][prov] = v
+            elif body.get(k) is None:
+                raw["keys"].pop(prov, None)   # null removes it; an empty box leaves it alone
+    with tx() as db:
+        set_setting_raw(db, "scan_ai", raw)
+        add_log("settings", "", "Scanning settings updated")
+    return api_scan_ai_get({}, {})
 
 
 @route("POST", "/api/shopping")
@@ -2367,8 +3456,12 @@ def api_backup(body, query):
         used = {}
         for r in DB.execute("SELECT item_id, ts, qty FROM usage ORDER BY id"):
             used.setdefault(r["item_id"], []).append([r["ts"], r["qty"]])
+        codes = {}
+        for r in DB.execute("SELECT code, item_id, product FROM barcodes ORDER BY code"):
+            codes.setdefault(r["item_id"], []).append({"code": r["code"], "product": r["product"]})
         for it in items:
             it["usage"] = used.get(it["id"], [])
+            it["barcodes"] = codes.get(it["id"], [])
         payload = {
             "app": "dadsarmy",
             "version": VERSION,
@@ -2401,6 +3494,11 @@ def api_restore(body, query):
         if not isinstance(it, dict):
             raise ApiError(400, "Backup file is damaged")
         data = clean_item(it)
+        data["_barcodes"] = []   # 1.13.0 on: codes, or {"code", "product"}; a damaged one is skipped
+        for c in (it.get("barcodes") if isinstance(it.get("barcodes"), list) else [])[:50]:
+            code = safe_barcode(c.get("code") if isinstance(c, dict) else c)
+            if code:
+                data["_barcodes"].append((code, clean_text(c.get("product"), 160) if isinstance(c, dict) else ""))
         bl = []
         batches = it.get("batches") or []
         if not isinstance(batches, list):
@@ -2410,7 +3508,7 @@ def api_restore(body, query):
                 q = clean_num(b.get("qty"), 0, 0, 1e7)
                 if q > 0:
                     bl.append((q, clean_date(b.get("expiry")), clean_text(b.get("location"), 80),
-                               clean_text(b.get("added_at"), 30) or now_iso()))
+                               clean_text(b.get("added_at"), 30) or now_iso(), clean_date(b.get("opened_at"))))
         used = []   # 1.11.0 on: what was used when
         for u in (it.get("usage") if isinstance(it.get("usage"), list) else [])[-2000:]:
             if isinstance(u, list) and len(u) == 2 and isinstance(u[0], str) and DATE_RE.match(u[0][:10]):
@@ -2467,11 +3565,16 @@ def api_restore(body, query):
     except Exception as e:
         raise ApiError(500, "Couldn't save a copy of what you have now, so nothing was restored (%s)" % e)
     ts = now_iso()
+    has_codes = any(isinstance(it, dict) and "barcodes" in it for it in items)
     with tx() as db:
+        # A backup from before 1.13.0 has no barcodes: keep yours, matched back up to the items by name.
+        kept_codes = [] if has_codes else [dict(r) for r in db.execute(
+            "SELECT b.code, b.product, b.added_at, lower(i.name) AS name FROM barcodes b JOIN items i ON i.id = b.item_id")]
         db.execute("DELETE FROM batches")
         db.execute("DELETE FROM items")
         db.execute("DELETE FROM shopping")
         db.execute("DELETE FROM usage")
+        db.execute("DELETE FROM barcodes")
         for key, v in settings_in.items():
             db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(v)))
         if warn_by_cat is not None:
@@ -2479,14 +3582,23 @@ def api_restore(body, query):
         ctx, rows = starter_ctx(get_settings()), starter_rows()
         for data, created, bl, used, starter in clean_items:
             new_id = insert_item(db, data, created, ts)
-            for q, exp, loc, added in bl:
-                db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at) VALUES (?, ?, ?, ?, ?)",
-                           (new_id, q, exp, loc, added))
+            for q, exp, loc, added, opened in bl:
+                db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at, opened_at) VALUES (?, ?, ?, ?, ?, ?)",
+                           (new_id, q, exp, loc, added, opened))
             for when, q in used:
                 db.execute("INSERT INTO usage(item_id, ts, qty) VALUES (?, ?, ?)", (new_id, when, q))
+            for code, product in data.get("_barcodes") or []:
+                db.execute("INSERT OR REPLACE INTO barcodes(code, item_id, product, added_at) VALUES (?, ?, ?, ?)",
+                           (code, new_id, product, ts))
             name, auto = starter if starter is not None else guess_starter(data["name"], data["target_qty"], ctx, rows)
             if name:
                 db.execute("UPDATE items SET starter = ?, auto_target = ? WHERE id = ?", (name, auto, new_id))
+        if kept_codes:
+            by_name = dict((r["name"].lower(), r["id"]) for r in db.execute("SELECT id, name FROM items"))
+            for c in kept_codes:
+                if c["name"] in by_name:
+                    db.execute("INSERT OR REPLACE INTO barcodes(code, item_id, product, added_at) VALUES (?, ?, ?, ?)",
+                               (c["code"], by_name[c["name"]], c["product"], c["added_at"]))
         for s in shopping:
             if isinstance(s, dict) and clean_text(s.get("text"), 200):
                 db.execute("INSERT INTO shopping(text, done, created_at) VALUES (?, ?, ?)",
@@ -2544,6 +3656,22 @@ def check_backup(path):
         conn.close()
 
 
+def scrub_secrets(con):
+    """API keys stay out of backup copies (they go into Home Assistant's backups too): paste them in again after a restore."""
+    con.execute("PRAGMA secure_delete = ON")   # overwrite the old values, not just unlink them
+    row = con.execute("SELECT value FROM settings WHERE key = 'scan_ai'").fetchone()
+    if row:
+        try:
+            raw = json.loads(row[0])
+            if isinstance(raw, dict) and raw.get("keys"):
+                raw["keys"] = {}
+                con.execute("UPDATE settings SET value = ? WHERE key = 'scan_ai'", (json.dumps(raw),))
+        except ValueError:
+            pass
+    con.commit()
+    con.execute("VACUUM")   # and no old copies left in free pages
+
+
 def make_backup(tag="auto"):
     """Copy the database to a new, dated file. The copy is written under a temporary name and checked;
     only then is it given its real name, and only then are old copies cleared out. A name that's
@@ -2556,6 +3684,7 @@ def make_backup(tag="auto"):
             dest = sqlite3.connect(tmp)
             try:
                 DB.backup(dest)
+                scrub_secrets(dest)
                 dest.execute("PRAGMA journal_mode = DELETE")   # one self-contained file, no -wal beside it
             finally:
                 dest.close()
@@ -2706,7 +3835,16 @@ def ha_entities(s):
     put("sensor.dads_army_hold_out", s["hold_out_days"], "Dads Army hold-out", "mdi:shield-home", "days", {
         "food_days": s["food_days"], "water_days": s["water_days"], "runs_out_first": s["runs_out_first"],
         "target_days": s["target_days"], "target_met": target_met, "people": s["people"]})
-    put("sensor.dads_army_food_days", s["food_days"], "Dads Army food", "mdi:food-drumstick", "days")
+    try:
+        ai = ai_stats()
+        put("sensor.dads_army_ai_spend", round(ai["cost_usd"], 4), "Dads Army AI spend this month", "mdi:robot-outline", "USD", {
+            "ai_answers": ai["ok"], "failed": ai["failed"], "today_answers": ai["today"]["ok"], "today_usd": round(ai["today"]["cost_usd"], 4),
+            "limit_usd": ai["limit_usd"] or None, "left_usd": ai["left_usd"], "last_month_usd": round(ai["last_month"]["cost_usd"], 4),
+            "dates_read": ai["tasks"]["dates"], "labels_read": ai["tasks"]["labels"], "since": ai["since"]})
+    except sqlite3.Error:
+        pass
+    put("sensor.dads_army_food_days", s["food_days"], "Dads Army food", "mdi:food-drumstick", "days",
+        {"goes_off_first_days": s["food_wasted_days"]})
     put("sensor.dads_army_water_days", s["water_days"], "Dads Army water", "mdi:water", "days")
     put("sensor.dads_army_kit_stocked", s["kit_stocked_pct"], "Dads Army kit stocked", "mdi:toolbox", "%")
     put("sensor.dads_army_out_of_stock", len(s["out_of_stock"]), "Dads Army out of stock",
@@ -6795,6 +7933,8 @@ def main():
     load_warnings()
     threading.Thread(target=backup_loop, name="backups", daemon=True).start()
     threading.Thread(target=history_loop, name="history", daemon=True).start()
+    threading.Thread(target=offline_loop, name="offline-barcodes", daemon=True).start()
+    sweep_scan_photos()
     threading.Thread(target=warnings_loop, name="warnings", daemon=True).start()
     if HA_TOKEN:
         threading.Thread(target=home_sensors_loop, name="home-sensors", daemon=True).start()
