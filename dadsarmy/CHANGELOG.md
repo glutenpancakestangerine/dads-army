@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.12.0
+## 1.13.0
 
 **Scan to add and use stock**
 
@@ -30,6 +30,15 @@
 - **Once opened, use within:** an open tin of beans keeps about 3 days. Using part of one makes the rest its own batch, dated when it was opened. It goes off then, even if its best before is later (in the app and in Home Assistant's sensors), and it's used first. New stock never joins an opened pack. Undo, backups and restores keep it opened.
 - Single cans from a multipack add up: one at a time, six times, leaves whole packs.
 - **Which batch is it from?** When there's more than one, **Use** asks, with the oldest ticked. **Match the date on it** reads the date from a photo and ticks that batch, so the right one goes down.
+
+## 1.12.0
+
+**New**
+
+- **Credits.** Help → **Credits**, or the link at the foot of HQ, thanks everyone who has built Dads Army and lists them, with the open data it uses.
+  - The words and names come from `CREDITS.md` in the GitHub repository, so they can be changed there.
+  - The app carries its own copy, so the page works with no internet.
+  - **Check GitHub for new names** gets the latest list, and adds anyone who has changed the code on GitHub. GitHub is only asked when you tap it, and nothing about you is sent.
 
 ## 1.11.0
 

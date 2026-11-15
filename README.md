@@ -119,11 +119,29 @@ To update, run `git pull` and then `bash install.sh` again. Your data is kept.
 
 Dads Army has no login of its own. Anyone on your home network who can reach port 8080 can open it. Through the Home Assistant sidebar, only signed-in Home Assistant users can open it. **Don't** port-forward 8080 on your router. To reach it while you're out, use Home Assistant Cloud, Tailscale or WireGuard.
 
+## Credits
+
+Dads Army is built by people who want households across the UK to be ready for whatever comes. Their names are in [`dadsarmy/CREDITS.md`](dadsarmy/CREDITS.md), and the app shows them under Help → **Credits**.
+
+To add a name, or change the thank-you message, edit `CREDITS.md` on GitHub. Notes at the top of the file explain the layout. The app picks up the change with its next update, or straight away when someone taps **Check GitHub for new names**.
+
+**New contributors are added for you.** After every push to `main`, a GitHub Action (`.github/workflows/credits.yml`) runs `tools/update_credits.py`:
+
+- **Who it finds:** everyone in the history, as an author or a `Co-authored-by`.
+- **What it adds:** anyone not yet named, under **Built by**, as "Name (@github-name): contributed code". It then commits the file.
+- **What it leaves alone:**
+  - anyone already named, by GitHub name or by name
+  - commits that only change `CREDITS.md`
+  - bots and AI coding assistants
+  - email addresses, which are never written
+
+You can change the words after a name; nobody is added twice. If one person shows up under two names, join them up with a [`.mailmap`](https://git-scm.com/docs/gitmailmap) file. To see who it would add, run `python3 tools/update_credits.py --check`.
+
 ---
 
 ## Releasing an update
 
-1. Make the changes in `dadsarmy/`.
+1. Pull first (`git pull --rebase`): the credits workflow may have added names on GitHub. Then make the changes in `dadsarmy/`.
 2. Raise the version number in both `dadsarmy/config.yaml` and `VERSION` in `dadsarmy/server.py`.
 3. Add an entry at the top of `dadsarmy/CHANGELOG.md`. Home Assistant shows it in the update dialog.
 4. Commit, tag (`git tag v1.2.0`) and push, including the tag.
@@ -136,7 +154,8 @@ Home Assistant checks for updates on its own. To check straight away, use **Sett
 - `dadsarmy/static/`: the phone app, in plain HTML, CSS and JavaScript. There's no build step, and nothing is loaded from the internet. `zxing.min.js` is the [ZXing](https://github.com/zxing-js/library) barcode reader (0.21.3, MIT licence), loaded only when you scan.
 - `dadsarmy/places/uk.tsv.gz`: the list of UK places for **Places to go**. It's built from an OpenStreetMap extract by `tools/build_places.py`, which needs [pyosmium](https://osmcode.org/pyosmium/). The app itself only reads the finished file.
 - `dadsarmy/config.yaml` and `Dockerfile`: the Home Assistant app definition.
-- `tests/`: about 110 tests of the server, backups, undo, Home Assistant sync and the feeds, using stand-ins for Home Assistant and the feeds, so they never touch the internet. Run them from the repository folder with `python3 -m unittest discover -s tests`.
+- `dadsarmy/CREDITS.md`: the thank-you and the names shown under Help → Credits, kept up to date by `tools/update_credits.py` and `.github/workflows/credits.yml`.
+- `tests/`: about 130 tests of the server, backups, undo, Home Assistant sync and the feeds, using stand-ins for Home Assistant and the feeds, so they never touch the internet. Run them from the repository folder with `python3 -m unittest discover -s tests`.
 - Your data lives in a single SQLite file, `dadsarmy.db`. On Raspberry Pi OS it's in `~/dadsarmy/data`; on Home Assistant it's in the app's own storage.
 
 *Don't panic.*

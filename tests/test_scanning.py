@@ -1,4 +1,4 @@
-"""Scanning (1.12.0): barcodes, what Open Food Facts and the AI give back, pack sizes, using part of one,
+"""Scanning (1.13.0): barcodes, what Open Food Facts and the AI give back, pack sizes, using part of one,
 opened packs, and the AI settings. Nothing here reaches the internet or a real AI."""
 import json
 
