@@ -132,3 +132,50 @@ class TestAI(AppTest):
         self.assertEqual(server.api_scan_ai_get({}, {})["keys_set"], ["anthropic"])
         server.api_scan_ai_put({"key_anthropic": None, "provider": "ha"}, {})   # null removes it
         self.assertEqual(server.api_scan_ai_get({}, {})["keys_set"], [])
+
+
+class TestOfflineList(AppTest):
+    def export(self, uk_rows):
+        """A small stand-in for Open Food Facts' export: tab-separated, gzipped, with extra columns."""
+        import gzip
+        import os
+        cols = ["code", "url", "product_name", "brands", "quantity", "product_quantity", "categories_tags",
+                "countries_en", "energy-kcal_100g", "other"]
+        lines = ["\t".join(cols)]
+        for i in range(uk_rows):
+            lines.append("\t".join(["50%011d" % i, "", "Baked beans %d" % i, "Heinz", "415 g", "415", "en:canned-foods",
+                                    "United Kingdom", "78", "x"]))
+        lines.append("\t".join(["3000000000001", "", "Pâte à tartiner", "Bovetti", "350 g", "350", "", "France", "617", "x"]))
+        lines.append("\t".join(["0012345678905", "", "Root beer", "Brand", "6 x 330 ml", "1980", "", "United States,United Kingdom", "40", "x"]))
+        lines.append("short\tline")   # a damaged line is skipped
+        path = os.path.join(self.dir, "export.csv.gz")
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return "file://" + path
+
+    def test_build_and_look_up(self):
+        server.offline_save(enabled=True)
+        self.assertTrue(server.build_offline(self.export(1500)))
+        st = server.offline_status()
+        self.assertEqual((st["count"], st["error"], st["building"]), (1501, "", False))   # the French one left out
+        server.OFF_CACHE.clear()
+        server.http_get = lambda url, **kw: self.fail("looked up online: " + url)
+        p = server.off_product("50" + "%011d" % 7)
+        self.assertEqual((p["name"], p["kcal_per_unit"], p["unit"], p["offline"]), ("Heinz Baked beans 7 (415 g)", 324, "tin", True))
+        self.assertEqual(server.offline_lookup("012345678905")["product_name"], "Root beer")   # a 12-digit UPC finds its EAN-13
+        self.assertIsNone(server.offline_lookup("3000000000001"))
+        self.assertFalse(server.build_offline(self.export(10)))        # a broken download keeps the old list
+        self.assertEqual(server.offline_status()["count"], 1501)
+        server.offline_save(enabled=False)
+        self.assertIsNone(server.offline_lookup("50" + "%011d" % 7))
+
+    def test_when_it_updates(self):
+        import datetime as dt
+        night, day = dt.datetime(2026, 12, 20, 3), dt.datetime(2026, 12, 20, 14)
+        cfg = {"enabled": True, "built_at": None, "tried_at": None}
+        self.assertTrue(server.offline_due(cfg, day))                  # never built: straight away
+        cfg["built_at"] = "2026-11-01T03:00:00"
+        self.assertTrue(server.offline_due(cfg, night))                # a month on, at night
+        self.assertFalse(server.offline_due(cfg, day))                 # but not in the day
+        cfg["tried_at"] = "2026-12-20T02:30:00"
+        self.assertFalse(server.offline_due(cfg, night))               # tried tonight already

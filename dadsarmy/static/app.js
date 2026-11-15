@@ -2821,8 +2821,42 @@
       '<p class="small muted">Barcodes are read on this phone and looked up in Open Food Facts (only the barcode is sent). Best before dates, and labels without a barcode, are read from a photo by an AI: about 0.1p a photo.</p>' +
       '<div class="field"><span>Who reads the photos</span><select data-scanai="provider" aria-label="Who reads the photos">' +
       Object.keys(P).map(function (k) { return '<option value="' + k + '"' + (k === prov ? ' selected' : '') + '>' + esc(P[k].name) + (k !== 'ha' && c.keys_set.indexOf(k) >= 0 ? ' (key saved)' : '') + '</option>'; }).join('') +
-      '</select></div>' + keyBox + '</section>';
+      '</select></div>' + keyBox + offlineBox() + '</section>';
   }
+  // The offline barcode list: on/off, how it's doing, and Update now.
+  var OFFLINE_ST = null, offlineTimer = null;
+  function offlineBox() {
+    if (!OFFLINE_ST) {
+      api('GET', 'api/scan/offline').then(function (r) { OFFLINE_ST = r; redrawScanCard(); }, function () { /* offline */ });
+      return '';
+    }
+    var o = OFFLINE_ST, state;
+    if (o.building) {
+      state = 'Updating: ' + (o.total_mb ? o.read_mb + ' of ' + o.total_mb + ' MB read' : 'starting') + (o.kept ? ', ' + nf0.format(o.kept) + ' UK products so far' : '') + '. This takes a while; you can carry on.';
+      clearTimeout(offlineTimer);
+      offlineTimer = setTimeout(function () { api('GET', 'api/scan/offline').then(function (r) { OFFLINE_ST = r; redrawScanCard(); }); }, 8000);
+    } else if (o.built_at) {
+      state = nf0.format(o.count) + ' UK products, updated ' + fmtDate(o.built_at.slice(0, 10)) + ' (' + o.size_mb + ' MB). It updates itself each month, overnight.';
+    } else {
+      state = o.enabled ? 'Not downloaded yet.' : 'Off: new barcodes are looked up online.';
+    }
+    return '<h3 class="plan-h">Offline barcode list</h3>' +
+      '<label class="offline-toggle"><span class="offline-toggle-text"><span class="offline-toggle-title">Keep a list of UK products on the Pi</span>' +
+      '<span class="offline-toggle-hint">So scanning works with the internet down. About 200,000 products from Open Food Facts, 25 MB on the Pi, and a 1.5 GB download each month.</span></span>' +
+      '<span class="switch"><input type="checkbox" data-offline="1"' + (o.enabled ? ' checked' : '') + '></span></label>' +
+      '<p class="small' + (o.error && !o.building ? ' err' : ' muted') + '">' + esc(state) + (o.error && !o.building ? ' Last try: ' + esc(o.error) + '.' : '') + '</p>' +
+      (o.enabled && !o.building ? '<button type="button" class="btn small" data-act="offline-update">Update now</button>' : '') +
+      '<p class="small muted">Product data © Open Food Facts contributors (Open Database Licence).</p>';
+  }
+  function redrawScanCard() { var el = $("#scanAiCard"); if (el) el.outerHTML = scanHqCard(); }
+  document.addEventListener('change', function (e) {
+    if (!e.target.dataset || !e.target.dataset.offline) return;
+    api('PUT', 'api/scan/offline', { enabled: e.target.checked }).then(function (r) {
+      OFFLINE_ST = r; redrawScanCard();
+      toast(r.enabled ? (r.building ? 'Downloading the UK list: it takes a while' : 'Offline list on') : 'Offline list off');
+    }, function (err) { toast(err.message, { error: true }); });
+  });
+
   function saveScanAi(body) {
     return api('PUT', 'api/scan/ai', body).then(function (r) { SCAN_AI = r; var el = $('#scanAiCard'); if (el) el.outerHTML = scanHqCard(); toast('Saved'); },
       function (e) { toast(e.message, { error: true }); });
@@ -3046,6 +3080,10 @@
       case 'dupe-stock':
         closeSheet();
         return openSheet({ type: 'stock', id: id });
+      case 'offline-update':
+        return run(function () {
+          return api('POST', 'api/scan/offline/update').then(function (r) { OFFLINE_ST = r; redrawScanCard(); toast('Updating the UK list: it takes a while'); });
+        }, a);
       case 'scanai-forget': {
         var fb = {};
         fb['key_' + a.dataset.prov] = null;

@@ -21,7 +21,7 @@ A stores tracker for food, water and emergency kit. It runs on a Raspberry Pi or
 - **HQ:** household size and pets, calorie and water needs, readiness target (3 days to a year), expiry warnings (earlier for medicines, if you like), backups, a printed hard copy, a starter list of about 95 essentials whose targets follow the household, light/dark mode, and the activity log.
 - **Undo** on anything you use or delete. Several phones can use it at once, and an undo never overwrites a newer change made on another one.
 
-It needs no internet to run, and nothing about you leaves your network. Place data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright) (see [dadsarmy/places](dadsarmy/places/README.md)). It uses the internet if you switch on warnings, and then it just downloads the public feeds: each is the whole country in one go, and Dads Army works out what's near you itself. If you scan, a new barcode is looked up in Open Food Facts (only the barcode is sent), and a photo of a best before date or label goes to the AI you choose (Home Assistant's own, or one with your key).
+It needs no internet to run, and nothing about you leaves your network. Place data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright) (see [dadsarmy/places](dadsarmy/places/README.md)). It uses the internet if you switch on warnings, and then it just downloads the public feeds: each is the whole country in one go, and Dads Army works out what's near you itself. If you scan, a new barcode is looked up in Open Food Facts (only the barcode is sent; or switch on the offline UK list, downloaded once a month), and a photo of a best before date or label goes to the AI you choose (Home Assistant's own, or one with your key).
 
 ---
 
@@ -136,7 +136,7 @@ Home Assistant checks for updates on its own. To check straight away, use **Sett
 - `dadsarmy/static/`: the phone app, in plain HTML, CSS and JavaScript. There's no build step, and nothing is loaded from the internet. `zxing.min.js` is the [ZXing](https://github.com/zxing-js/library) barcode reader (0.21.3, MIT licence), loaded only when you scan.
 - `dadsarmy/places/uk.tsv.gz`: the list of UK places for **Places to go**. It's built from an OpenStreetMap extract by `tools/build_places.py`, which needs [pyosmium](https://osmcode.org/pyosmium/). The app itself only reads the finished file.
 - `dadsarmy/config.yaml` and `Dockerfile`: the Home Assistant app definition.
-- `tests/`: about 105 tests of the server, backups, undo, Home Assistant sync and the feeds, using stand-ins for Home Assistant and the feeds, so they never touch the internet. Run them from the repository folder with `python3 -m unittest discover -s tests`.
+- `tests/`: about 110 tests of the server, backups, undo, Home Assistant sync and the feeds, using stand-ins for Home Assistant and the feeds, so they never touch the internet. Run them from the repository folder with `python3 -m unittest discover -s tests`.
 - Your data lives in a single SQLite file, `dadsarmy.db`. On Raspberry Pi OS it's in `~/dadsarmy/data`; on Home Assistant it's in the app's own storage.
 
 *Don't panic.*

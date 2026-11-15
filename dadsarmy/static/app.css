@@ -990,3 +990,8 @@ svg text { stroke: none; fill: currentColor; }   /* the svg rule above is for ic
 .callout { border-radius: 10px; padding: 10px 12px; margin: 0 0 12px; background: var(--surface-2, rgba(127,127,127,.12)); }
 .opts { display: grid; gap: 6px; }
 .opts .opt { display: flex; gap: 10px; align-items: center; min-height: 40px; }
+.offline-toggle { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 8px 0; cursor: pointer; }
+.offline-toggle-text { display: flex; flex-direction: column; gap: 2px; }
+.offline-toggle-title { font-weight: 650; }
+.offline-toggle-hint { font-size: 13px; color: var(--muted); }
+.offline-toggle input { width: 22px; height: 22px; flex: none; }

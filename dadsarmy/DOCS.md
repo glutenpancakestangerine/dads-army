@@ -429,6 +429,8 @@ Dads Army records one line a day from 1.11.0, and keeps five years. When it firs
 
 It costs about 0.1p a photo. The photo is put in Home Assistant's media folder only while the AI reads it, then deleted.
 
+**Scanning with the internet down.** Barcodes you've scanned before always work. For new ones, switch on **Keep a list of UK products on the Pi** in **HQ → Scanning**. Dads Army then downloads Open Food Facts' public export (about 1.5 GB) and keeps the products sold in the UK, about 180,000 of them in 25 MB. It does this straight away, then once a month between 2 and 5 in the morning; **Update now** does it on demand. If a download goes wrong, the old list stays. The list is left out of Home Assistant backups. Reading a date or a label from a photo still needs the internet: type the date instead. Product data © Open Food Facts contributors, under the Open Database Licence.
+
 ## On a tablet or a wider screen
 
 On a screen 900 pixels wide or more, such as a landscape tablet on the wall:

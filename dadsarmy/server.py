@@ -1505,9 +1505,16 @@ def clean_barcode(v, required=True):
 
 
 def off_product(code):
-    """Name (in English), size, calories and a category guess for a barcode, from Open Food Facts. None if unknown."""
+    """Name (in English), size, calories and a category guess for a barcode: from the offline UK list if it's there,
+    otherwise from Open Food Facts online. None if unknown."""
     if code in OFF_CACHE:
         return OFF_CACHE[code]
+    local = offline_lookup(code)
+    if local:
+        out = product_from(code, local)
+        out["offline"] = True
+        OFF_CACHE[code] = out
+        return out
     try:
         d = json.loads(http_get(OFF_URL % code).decode("utf-8"))
     except urllib.error.HTTPError as e:
@@ -1519,6 +1526,13 @@ def off_product(code):
     if not p:
         OFF_CACHE[code] = None
         return None
+    out = product_from(code, p)
+    OFF_CACHE[code] = out
+    return out
+
+
+def product_from(code, p):
+    """An Open Food Facts product (the online JSON, or a row of the offline list) shaped for Dads Army."""
     english = (p.get("product_name_en") or p.get("abbreviated_product_name_en") or p.get("generic_name_en") or "").strip()
     name = english or (p.get("product_name") or "").strip()
     if name and not english and str(p.get("lang") or "en") != "en":
@@ -1546,7 +1560,6 @@ def off_product(code):
            "category": "water" if drink else "food", "count": count,
            "litres_per_unit": round(grams / 1000.0, 2) if drink and grams else 0,
            "unit": "bottle" if drink else ("tin" if re.search(r"canned|tinned", tags) else "pack")}
-    OFF_CACHE[code] = out
     return out
 
 
@@ -1723,6 +1736,233 @@ def photo_from(body):
     if not img.startswith(b"\xff\xd8") or len(img) > 3000000:
         raise ApiError(400, "Send a JPEG photo under 3 MB")
     return img
+
+
+# --------------------------------------------------------------------------
+# The offline barcode list: every product Open Food Facts lists as sold in the UK (about 200,000), kept on the
+# Pi so scanning works with the internet down. Built from Open Food Facts' public export (about 1.5 GB,
+# compressed), read as it downloads, once a month at night and whenever asked. Kept in its own small database
+# beside Dads Army's, left out of Home Assistant backups (config.yaml), as it can always be downloaded again.
+# Data © Open Food Facts contributors, under the Open Database Licence.
+# --------------------------------------------------------------------------
+OFFLINE_URL = os.environ.get("DADSARMY_OFF_EXPORT", "https://static.openfoodfacts.org/data/en.openfoodfacts.org.products.csv.gz")
+OFFLINE_EVERY_DAYS = 30
+OFFLINE_HOURS = (2, 5)   # build between 2 and 5 in the morning, when no one's scanning
+OFFLINE = {"building": False, "read_mb": 0, "total_mb": 0, "rows": 0, "kept": 0, "conn": None, "path": None}
+OFFLINE_LOCK = threading.Lock()
+OFFLINE_COLS = ("code", "product_name", "brands", "quantity", "product_quantity", "energy-kcal_100g",
+                "categories_tags", "countries_en")
+
+
+def offline_cfg():
+    try:
+        c = (setting_raw("offline_barcodes", {}) or {}) if DB is not None else {}
+    except sqlite3.Error:   # no database (yet): off
+        c = {}
+    return {"enabled": bool(c.get("enabled")), "built_at": c.get("built_at"), "count": int(c.get("count") or 0),
+            "error": str(c.get("error") or ""), "tried_at": c.get("tried_at")}
+
+
+def offline_save(**kw):
+    c = setting_raw("offline_barcodes", {}) or {}
+    c.update(kw)
+    with tx() as db:
+        set_setting_raw(db, "offline_barcodes", c)
+
+
+def offline_db():
+    return os.path.join(DATA_DIR, "barcodes_uk.db")
+
+
+def offline_conn():
+    with OFFLINE_LOCK:
+        if OFFLINE["conn"] is not None and OFFLINE["path"] != offline_db():
+            OFFLINE["conn"].close()
+            OFFLINE["conn"] = None
+        if OFFLINE["conn"] is None and os.path.exists(offline_db()):
+            try:
+                OFFLINE["conn"] = sqlite3.connect("file:%s?mode=ro" % offline_db(), uri=True, check_same_thread=False)
+                OFFLINE["path"] = offline_db()
+            except sqlite3.Error:
+                OFFLINE["conn"] = None
+        return OFFLINE["conn"]
+
+
+def offline_lookup(code):
+    """The offline list's row for a barcode (as an Open Food Facts product), or None."""
+    if not offline_cfg()["enabled"]:
+        return None
+    conn = offline_conn()
+    if conn is None:
+        return None
+    codes = [code] + ([code.zfill(13)] if len(code) < 13 else []) + ([code.lstrip("0")] if code.startswith("0") else [])
+    try:
+        with OFFLINE_LOCK:
+            row = None
+            for c in codes:
+                row = conn.execute("SELECT name, brand, quantity, grams, kcal100, cats FROM products WHERE code = ?", (c,)).fetchone()
+                if row:
+                    break
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    return {"product_name": row[0], "brands": row[1], "quantity": row[2], "product_quantity": row[3],
+            "product_quantity_unit": "g", "nutriments": {"energy-kcal_100g": row[4]},
+            "categories_tags": (row[5] or "").split(","), "lang": "en"}
+
+
+class _Counted(object):
+    """A file that counts what's been read from it (for progress)."""
+    def __init__(self, f):
+        self.f, self.n = f, 0
+
+    def read(self, size=-1):
+        b = self.f.read(size)
+        self.n += len(b)
+        OFFLINE["read_mb"] = round(self.n / 1048576.0)
+        return b
+
+    def readable(self):
+        return True
+
+
+def build_offline(url=None):
+    """Download the export, keep the UK products, and swap the new list in. Runs on its own thread."""
+    with OFFLINE_LOCK:
+        if OFFLINE["building"]:
+            return False
+        OFFLINE.update(building=True, read_mb=0, total_mb=0, rows=0, kept=0)
+    tmp = offline_db() + ".new"
+    try:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        out = sqlite3.connect(tmp)
+        out.execute("PRAGMA journal_mode = OFF")
+        out.execute("PRAGMA synchronous = OFF")
+        out.execute("CREATE TABLE products (code TEXT PRIMARY KEY, name TEXT, brand TEXT, quantity TEXT, grams REAL, "
+                    "kcal100 REAL, cats TEXT)")
+        req = urllib.request.Request(url or OFFLINE_URL, headers={"User-Agent": FEED_UA})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            OFFLINE["total_mb"] = round(int(r.headers.get("Content-Length") or 0) / 1048576.0)
+            raw = _Counted(r)
+            text = io.TextIOWrapper(gzip.GzipFile(fileobj=raw), encoding="utf-8", errors="replace", newline="\n")
+            head = text.readline().rstrip("\n").split("\t")
+            try:
+                ix = dict((c, head.index(c)) for c in OFFLINE_COLS)
+            except ValueError as e:
+                raise ValueError("Open Food Facts changed its export (%s)" % e)
+            width, batch = len(head), []
+            ci = ix["countries_en"]
+            for line in text:
+                OFFLINE["rows"] += 1
+                if "United Kingdom" not in line:
+                    continue
+                f = line.rstrip("\n").split("\t")
+                if len(f) != width or "United Kingdom" not in f[ci]:
+                    continue
+                code = f[ix["code"]].strip()
+                name = f[ix["product_name"]].strip()
+                if not name or not re.fullmatch(r"[0-9]{6,14}", code):
+                    continue
+
+                def num(v):
+                    try:
+                        x = float(v)
+                        return x if 0 < x < 100000 else None
+                    except ValueError:
+                        return None
+                batch.append((code, name[:120], f[ix["brands"]].strip()[:80], f[ix["quantity"]].strip()[:40],
+                              num(f[ix["product_quantity"]]), num(f[ix["energy-kcal_100g"]]),
+                              f[ix["categories_tags"]][:400]))
+                if len(batch) >= 5000:
+                    out.executemany("INSERT OR REPLACE INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
+                    OFFLINE["kept"] += len(batch)
+                    batch = []
+                    if not offline_cfg()["enabled"]:
+                        raise ValueError("switched off while updating")
+            if batch:
+                out.executemany("INSERT OR REPLACE INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
+                OFFLINE["kept"] += len(batch)
+        out.commit()
+        count = out.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        out.close()
+        if count < 1000:
+            raise ValueError("only %d UK products came through, so the old list was kept" % count)
+        with OFFLINE_LOCK:
+            if OFFLINE["conn"] is not None:
+                OFFLINE["conn"].close()
+                OFFLINE["conn"] = None
+            os.replace(tmp, offline_db())
+        OFF_CACHE.clear()
+        offline_save(built_at=now_iso(), count=count, error="", tried_at=now_iso())
+        add_log("settings", "", "Offline barcode list updated: %d UK products" % count)
+        return True
+    except Exception as e:
+        offline_save(error=str(getattr(e, "reason", e))[:200], tried_at=now_iso())
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    finally:
+        OFFLINE["building"] = False
+
+
+def offline_due(c, now=None):
+    now = now or dt.datetime.now()
+    if not c["enabled"] or OFFLINE["building"]:
+        return False
+    if c["tried_at"] and (now - dt.datetime.fromisoformat(c["tried_at"][:19])).total_seconds() < 20 * 3600:
+        return False   # tried in the last day (and maybe failed): not again yet
+    if not c["built_at"]:
+        return True
+    old = (now - dt.datetime.fromisoformat(c["built_at"][:19])).days >= OFFLINE_EVERY_DAYS
+    return old and OFFLINE_HOURS[0] <= now.hour < OFFLINE_HOURS[1]
+
+
+def offline_loop():
+    while True:
+        try:
+            if offline_due(offline_cfg()):
+                build_offline()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(600)
+
+
+def offline_status():
+    c = offline_cfg()
+    size = os.path.getsize(offline_db()) if os.path.exists(offline_db()) else 0
+    return dict(c, building=OFFLINE["building"], read_mb=OFFLINE["read_mb"], total_mb=OFFLINE["total_mb"],
+                kept=OFFLINE["kept"], size_mb=round(size / 1048576.0, 1))
+
+
+@route("GET", "/api/scan/offline")
+def api_scan_offline(body, query):
+    return offline_status()
+
+
+@route("PUT", "/api/scan/offline")
+def api_scan_offline_set(body, query):
+    if body.get("enabled") not in (True, False):
+        raise ApiError(400, "Say on or off")
+    offline_save(enabled=bool(body["enabled"]), tried_at=None if body["enabled"] else offline_cfg()["tried_at"])
+    if body["enabled"] and not offline_cfg()["built_at"]:
+        threading.Thread(target=build_offline, name="offline-barcodes", daemon=True).start()   # the first one now
+    add_log("settings", "", "Offline barcode list %s" % ("on" if body["enabled"] else "off"))
+    return offline_status()
+
+
+@route("POST", "/api/scan/offline/update")
+def api_scan_offline_update(body, query):
+    if not offline_cfg()["enabled"]:
+        raise ApiError(400, "Switch the offline list on first")
+    if not OFFLINE["building"]:
+        threading.Thread(target=build_offline, name="offline-barcodes", daemon=True).start()
+    return dict(offline_status(), building=True)
 
 
 @route("GET", "/api/scan/barcode")
@@ -7013,6 +7253,7 @@ def main():
     load_warnings()
     threading.Thread(target=backup_loop, name="backups", daemon=True).start()
     threading.Thread(target=history_loop, name="history", daemon=True).start()
+    threading.Thread(target=offline_loop, name="offline-barcodes", daemon=True).start()
     threading.Thread(target=warnings_loop, name="warnings", daemon=True).start()
     if HA_TOKEN:
         threading.Thread(target=home_sensors_loop, name="home-sensors", daemon=True).start()

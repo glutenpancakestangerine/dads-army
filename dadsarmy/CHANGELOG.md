@@ -11,6 +11,7 @@
 - **Read the best before date from a photo** when adding stock or a new item, or type it as before.
 - **Which AI:** Home Assistant's own AI Task (whatever you've set up there: Google Gemini, Anthropic Claude or OpenAI), or one of those directly with your own key, in **HQ → Scanning**. Keys stay on the Pi, are never shown back and aren't in backups. A photo is deleted as soon as it's been read. About 0.1p a photo.
 - The barcode reader is the open-source ZXing library, included with the app (MIT licence), so it works without the internet.
+- **Offline barcode list.** In **HQ → Scanning**, keep a list of the products Open Food Facts lists as sold in the UK (about 180,000) on the Pi, so scanning a new barcode works with the internet down. It's built from Open Food Facts' public export (a 1.5 GB download, read as it arrives, about 25 MB on the Pi): the first time when it's switched on, then once a month overnight, or with **Update now**. Barcodes are looked up there first, then online. It's left out of Home Assistant backups, as it can always be downloaded again.
 
 **One line per product, many batches**
 

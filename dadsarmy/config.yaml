@@ -19,6 +19,9 @@ ingress: true
 # /media: a photo of a best before date is put here for Home Assistant's AI to read, then deleted.
 map:
   - media:rw
+# The offline barcode list can always be downloaded again, so it's left out of backups.
+backup_exclude:
+  - "barcodes_uk.db*"
 ingress_port: 8080
 panel_icon: mdi:chevron-triple-up
 panel_title: Dads Army
