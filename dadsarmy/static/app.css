@@ -995,3 +995,16 @@ svg text { stroke: none; fill: currentColor; }   /* the svg rule above is for ic
 .offline-toggle-title { font-weight: 650; }
 .offline-toggle-hint { font-size: 13px; color: var(--muted); }
 .offline-toggle input { width: 22px; height: 22px; flex: none; }
+.ai-meter { height: 8px; border-radius: 4px; background: var(--surface-2); overflow: hidden; margin: -6px 0 10px; }
+.ai-meter > span { display: block; height: 100%; background: var(--olive); }
+.stat[data-state="warn"] .stat-val { color: var(--warn, #b26a00); }
+.stat[data-state="bad"] .stat-val { color: var(--bad, #b3261e); }
+.ai-calls { margin-top: 8px; }
+.ai-calls > summary { cursor: pointer; font-weight: 650; min-height: 36px; }
+.ai-table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 8px 0 4px; }
+.ai-table th, .ai-table td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.ai-table th:first-child, .ai-table td:first-child { text-align: left; }
+.ai-table th { color: var(--muted); font-weight: 650; font-size: 12px; }
+/* The − button: easy to see in light mode, and plainly switched off when there's nothing to take away. */
+.qbtn { border: 1.5px solid color-mix(in srgb, var(--ink) 38%, transparent); }
+.qbtn:disabled { opacity: .45; border-style: dashed; }

@@ -451,6 +451,14 @@ def init_db():
     DB.execute("CREATE TABLE IF NOT EXISTS barcodes (code TEXT PRIMARY KEY, "
                "item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE, product TEXT NOT NULL DEFAULT '', "
                "added_at TEXT NOT NULL)")   # 1.12.0: barcodes scanned, each pointing at one item
+    DB.execute("CREATE TABLE IF NOT EXISTS ai_calls (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, "
+               "ai TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', task TEXT NOT NULL DEFAULT '', "
+               "tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0, cost_usd REAL, "
+               "ok INTEGER NOT NULL DEFAULT 1, note TEXT NOT NULL DEFAULT '')")   # 1.12.0: what the AI cost
+    DB.execute("CREATE INDEX IF NOT EXISTS idx_ai_calls_ts ON ai_calls(ts)")
+    # 1.12.0: one code per product (a 12-digit UPC-A is kept as its 13-digit EAN, a 0 in front).
+    DB.execute("UPDATE OR IGNORE barcodes SET code = '0' || code WHERE length(code) = 12")
+    DB.execute("DELETE FROM barcodes WHERE length(code) = 12")
     for key, value in DEFAULT_SETTINGS.items():
         DB.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(value)))
     with tx() as db:
@@ -678,6 +686,23 @@ def all_items():
     return items
 
 
+def open_dated(items):
+    """Items with each opened pack's expiry brought forward to its "use within N days once opened" date
+    (whichever is sooner), as the app shows it. For working things out; backups keep the printed date."""
+    for it in items:
+        days = it.get("open_days") or 0
+        for b in it["batches"]:
+            if days > 0 and b.get("opened_at"):
+                try:
+                    until = (dt.date.fromisoformat(b["opened_at"][:10]) + dt.timedelta(days=days)).isoformat()
+                except ValueError:
+                    continue
+                if not b["expiry"] or until < b["expiry"]:
+                    b["expiry"] = until
+        it["batches"].sort(key=lambda b: (b.get("opened_at") is None, b["expiry"] is None, b["expiry"] or "", b["id"]))
+    return items
+
+
 LIST_LIMIT = 30  # longest list sent to Home Assistant, to keep its database lean
 
 
@@ -755,7 +780,7 @@ def summary():
     today = dt.date.today()
     with LOCK:
         st = get_settings()
-        items = all_items()
+        items = open_dated(all_items())
         extras = [r["text"] for r in DB.execute("SELECT text FROM shopping WHERE done = 0 ORDER BY id")]
         checks = [dict(r) for r in DB.execute("SELECT * FROM checks")]
         warnings = warn_brief()
@@ -1117,6 +1142,13 @@ def snapshot(db, item_id):
     return {"item": item, "batches": batches}
 
 
+def with_barcodes(db, snap):
+    """For deleting an item: its barcodes go with it (ON DELETE CASCADE), and come back with an undo."""
+    snap["barcodes"] = [[r["code"], r["product"], r["added_at"]] for r in db.execute(
+        "SELECT code, product, added_at FROM barcodes WHERE item_id = ?", (snap["item"]["id"],))]
+    return snap
+
+
 def touch(db, item_id):
     db.execute("UPDATE items SET updated_at = ?, rev = rev + 1 WHERE id = ?", (now_iso(), item_id))
 
@@ -1215,7 +1247,7 @@ def api_item_update(body, query, item_id):
 def api_item_delete(body, query, item_id):
     item_id = as_int_id(item_id)
     with tx() as db:
-        snap = snapshot(db, item_id)
+        snap = with_barcodes(db, snapshot(db, item_id))
         db.execute("DELETE FROM items WHERE id = ?", (item_id,))
         add_log("removed", snap["item"]["name"], "Item deleted")
         undo_of(db, snap, item_id)
@@ -1248,7 +1280,7 @@ def api_items_delete(body, query):
         for item_id in wanted:
             if not db.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone():
                 continue   # already gone (deleted on another phone)
-            snaps.append(snapshot(db, item_id))
+            snaps.append(with_barcodes(db, snapshot(db, item_id)))
             db.execute("DELETE FROM items WHERE id = ?", (item_id,))
             snaps[-1]["after"] = None
         if not snaps:
@@ -1287,9 +1319,21 @@ def api_stock_add(body, query, item_id):
     return {"ok": True}
 
 
-def settle_batch(db, b, left):
+def snap_left(left, step=None):
+    """What's left, tidied: a count multipack (6 cans) moves in sixths, so 0.998 is 1 and 0.001 is none."""
+    if step:
+        n = round(left / step)
+        if abs(left - n * step) < 0.02:
+            left = round(n * step, 3)
+    if abs(left - round(left)) < 0.005:
+        left = float(round(left))
+    return max(0.0, left)
+
+
+def settle_batch(db, b, left, step=None):
     """A batch after some was used. Part of one left means it's been opened: that part becomes its own batch,
     dated today, so it can go off sooner ("use within 3 days once opened") and is used first."""
+    left = snap_left(left, step)
     if left <= 0:
         db.execute("DELETE FROM batches WHERE id = ?", (b["id"],))
         return
@@ -1317,6 +1361,8 @@ def api_use(body, query, item_id):
         snap = snapshot(db, item_id)
         item = snap["item"]
         remaining = qty
+        pk = db.execute("SELECT pack_size, pack_unit FROM items WHERE id = ?", (item_id,)).fetchone()
+        step = 1.0 / pk["pack_size"] if pk and pk["pack_unit"] == "each" and (pk["pack_size"] or 0) >= 2 else None
         rows = db.execute("SELECT id, item_id, qty, expiry, location, added_at, opened_at FROM batches "
                           "WHERE item_id = ? AND qty > 0 ORDER BY opened_at IS NULL, expiry IS NULL, expiry, id",
                           (item_id,)).fetchall()
@@ -1330,8 +1376,8 @@ def api_use(body, query, item_id):
             if remaining <= 0:
                 break
             take = min(b["qty"], remaining)
-            settle_batch(db, b, round(b["qty"] - take, 3))
-            remaining = round(remaining - take, 3)
+            settle_batch(db, b, round(b["qty"] - take, 3), step)
+            remaining = snap_left(round(remaining - take, 3), step)
         used = round(qty - remaining, 3)
         if used <= 0:
             raise ApiError(409, "There's none of that left to use")
@@ -1447,6 +1493,11 @@ def restore_snapshot(db, snap):
         if col in item:
             v = clean_text(item.get(col), 120) if col == "starter" else (1 if item.get(col) else 0)
             db.execute("UPDATE items SET %s = ? WHERE id = ?" % col, (v, item_id))
+    if not exists and isinstance(snap.get("barcodes"), list):   # undoing a delete: its barcodes come back
+        for c in snap["barcodes"][:200]:
+            if isinstance(c, list) and len(c) == 3 and safe_barcode(c[0]):
+                db.execute("INSERT OR IGNORE INTO barcodes(code, item_id, product, added_at) VALUES (?, ?, ?, ?)",
+                           (safe_barcode(c[0]), item_id, clean_text(c[1], 160), clean_text(c[2], 30) or now_iso()))
     usage = snap.get("usage")
     if isinstance(usage, int) and not isinstance(usage, bool):
         db.execute("DELETE FROM usage WHERE id = ? AND item_id = ?", (usage, item_id))
@@ -1480,6 +1531,96 @@ AI_PROVIDERS = {
     "google": {"name": "Google Gemini", "model": "gemini-flash-latest"},
     "openai": {"name": "OpenAI", "model": "gpt-4.1-mini"},
 }
+# US dollars per million tokens (in, out), for working out what each call cost. Others aren't priced.
+AI_PRICES = {"claude-haiku-5-5": (0.10, 0.50), "claude-sonnet-5-5": (2.0, 10.0), "claude-opus-5-5": (4.0, 20.0),
+             "claude-haiku-4-5": (1.0, 5.0), "claude-sonnet-5": (2.0, 10.0),
+             # Google's and OpenAI's list prices for the default models, rounded up (check their pricing pages).
+             "gemini-flash-latest": (0.30, 2.50), "gpt-4.1-mini": (0.40, 1.60)}
+# Any other model is costed at this, on the high side, so the monthly limit still stops it.
+AI_PRICE_UNKNOWN = (3.0, 15.0)
+AI_NAMES = (("anthropic", "Claude"), ("claude", "Claude"), ("google", "Gemini"), ("gemini", "Gemini"), ("openai", "OpenAI"))
+
+
+def ai_name(who):
+    return next((n for k, n in AI_NAMES if k in str(who).lower()), "The AI")
+
+
+def friendly_ai_error(who, text):
+    """What went wrong, in plain words: busy, allowance used up, no credit, or the key refused."""
+    t, name = str(text or ""), ai_name(who)
+    low = t.lower()
+    code = lambda n: re.search(r"(?<!\d)%s(?!\d)" % n, t)
+    if "timed out" in low or "timeout" in low:
+        return "%s took too long to answer. Try again." % name
+    if code(503) or code(529) or "high demand" in low or "overloaded" in low or "unavailable" in low:
+        return "%s is busy right now (on their side, not your allowance). Try again in a minute." % name
+    if "insufficient funds" in low or "credit" in low or "billing" in low:
+        return "%s's account has no credit left." % name
+    if code(429) or "quota" in low or "resource_exhausted" in low or "rate limit" in low:
+        return "%s's allowance is used up for now. Try again later, or check your plan." % name
+    if code(401) or code(403) or "api key" in low or "api_key" in low or "authentication" in low or "permission" in low:
+        return "%s didn't accept the API key." % name
+    t = re.sub(r"(sk-|AIza|key[=: ]+)[A-Za-z0-9*_\-]{6,}", r"\1…", t)   # never a key, even a masked one
+    return "%s couldn't answer (%s)" % (name, t[:120])
+
+
+def record_ai(ai, model, task, usage, ok, note=""):
+    tin, tout = int(usage.get("in") or 0), int(usage.get("out") or 0)
+    # Home Assistant's AI Task is paid for there (no token counts come back); direct calls are costed here.
+    price = AI_PRICES.get(model, AI_PRICE_UNKNOWN) if model else None
+    cost = round((tin * price[0] + tout * price[1]) / 1e6, 6) if price else None
+    try:
+        with tx() as db:
+            db.execute("INSERT INTO ai_calls(ts, ai, model, task, tokens_in, tokens_out, cost_usd, ok, note) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (now_iso(), ai, model or "", task, tin, tout, cost, 1 if ok else 0,
+                                                               str(note)[:200]))
+            db.execute("DELETE FROM ai_calls WHERE ts < ?", ((dt.date.today() - dt.timedelta(days=400)).isoformat(),))
+    except Exception:
+        traceback.print_exc()
+    HA_WAKE.set()   # the spend sensor in Home Assistant catches up straight away
+
+
+def month_spend(today=None):
+    today = today or dt.date.today()
+    start = today.replace(day=1).isoformat()
+    row = DB.execute("SELECT COUNT(*), IFNULL(SUM(cost_usd), 0), SUM(ok) FROM ai_calls WHERE ts >= ?", (start,)).fetchone()
+    return {"calls": row[0], "ok": row[2] or 0, "cost_usd": round(row[1], 6), "since": start}
+
+
+AI_TASKS = (("Dads Army best before", "dates"), ("Dads Army label", "labels"))
+
+
+def ai_stats(today=None):
+    """This month, today and last month, and what the AI was used for: for the stats in HQ and Home Assistant."""
+    today = today or dt.date.today()
+    m = month_spend(today)
+    last_start = (today.replace(day=1) - dt.timedelta(days=1)).replace(day=1).isoformat()
+
+    def span(a, b):
+        r = DB.execute("SELECT COUNT(*), IFNULL(SUM(cost_usd), 0), IFNULL(SUM(ok), 0) FROM ai_calls WHERE ts >= ? AND ts < ?",
+                       (a, b)).fetchone()
+        return {"calls": r[0], "ok": r[2], "cost_usd": round(r[1], 6)}
+    tasks = {"dates": 0, "labels": 0, "other": 0}
+    for r in DB.execute("SELECT task, COUNT(*) FROM ai_calls WHERE ts >= ? AND ok = 1 GROUP BY task", (m["since"],)):
+        tasks[next((k for t, k in AI_TASKS if r[0] == t), "other")] += r[1]
+    tok = DB.execute("SELECT IFNULL(SUM(tokens_in), 0), IFNULL(SUM(tokens_out), 0) FROM ai_calls WHERE ts >= ?", (m["since"],)).fetchone()
+    limit = scan_ai_cfg()["limit_usd"]
+    return dict(m, failed=m["calls"] - m["ok"], tokens_in=tok[0], tokens_out=tok[1], tasks=tasks,
+                avg_usd=round(m["cost_usd"] / m["ok"], 6) if m["ok"] else None,
+                limit_usd=limit, left_usd=round(max(0.0, limit - m["cost_usd"]), 4) if limit else None,
+                today=span(today.isoformat(), (today + dt.timedelta(days=1)).isoformat()),
+                last_month=span(last_start, m["since"]))
+
+
+def ai_limit_check(c):
+    """Stop before a paid call once this month's limit is reached."""
+    limit = float(c.get("limit_usd") or 0)
+    if limit > 0 and month_spend()["cost_usd"] >= limit:
+        nxt = (dt.date.today().replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+        raise ApiError(402, "This month's AI limit ($%.2f) is used up. It starts again on %s, or raise it in HQ → Scanning."
+                       % (limit, nxt.strftime("%-d %B")))
+
+
 DATE_PROMPT = ("Read the best before, best before end or use by date printed on this food or drink packaging. "
                "Reply with only the date as YYYY-MM-DD. If only a month and year are printed, use the last day of "
                "that month. If there's no date you can read, reply NONE.")
@@ -1501,7 +1642,20 @@ def clean_barcode(v, required=True):
         return ""
     if not re.fullmatch(r"[0-9]{6,14}", v):
         raise ApiError(400, "That isn't a product barcode")
+    # One product, one code: a 12-digit UPC-A is the 13-digit EAN with a 0 in front, and a 14-digit
+    # GTIN starting 0 (from a DataBar) is the same 13-digit one.
+    if len(v) == 12:
+        v = "0" + v
+    elif len(v) == 14 and v.startswith("0"):
+        v = v[1:]
     return v
+
+
+def safe_barcode(v):
+    try:
+        return clean_barcode(v)
+    except ApiError:
+        return None
 
 
 def off_product(code):
@@ -1568,7 +1722,17 @@ def scan_ai_cfg():
     raw = setting_raw("scan_ai", {}) or {}
     prov = raw.get("provider") if raw.get("provider") in AI_PROVIDERS else "ha"
     keys = dict((k, v) for k, v in (raw.get("keys") or {}).items() if k in AI_PROVIDERS and isinstance(v, str) and v)
-    return {"provider": prov, "model": str(raw.get("model") or ""), "keys": keys}
+    return {"provider": prov, "model": str(raw.get("model") or ""), "keys": keys, "limit_usd": float(raw.get("limit_usd") or 0)}
+
+
+def sweep_scan_photos():
+    """Photos are deleted once the AI has read them; one left by a restart mid-question goes now."""
+    try:
+        for n in os.listdir(SCAN_DIR):
+            if n.startswith("scan-") and n.endswith(".jpg"):
+                os.remove(os.path.join(SCAN_DIR, n))
+    except OSError:
+        pass
 
 
 def ai_task_entities():
@@ -1599,32 +1763,45 @@ def _post_json(url, body, headers, timeout=60):
         raise IOError("HTTP %d%s" % (e.code, (": " + str(msg)[:120]) if msg else ""))
 
 
-def ai_direct(provider, key, model, prompt, img_b64=None):
-    """Ask one provider directly, with an optional JPEG. Returns the reply text."""
+def ai_direct(provider, key, model, prompt, img_b64=None, usage=None):
+    """Ask one provider directly, with an optional JPEG. Returns the model's reply text; tokens go in `usage`."""
+    usage = usage if usage is not None else {}
     if provider == "anthropic":
-        # The Messages API over plain HTTPS (Dads Army is standard library only, so no SDK).
+        # Messages API over plain HTTPS (the add-on is standard library only, so no SDK).
         content = ([{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}}]
                    if img_b64 else []) + [{"type": "text", "text": prompt}]
         out = _post_json("https://api.anthropic.com/v1/messages", {
-            "model": model or AI_PROVIDERS["anthropic"]["model"], "max_tokens": 2048, "output_config": {"effort": "low"},
-            "messages": [{"role": "user", "content": content}]}, {"x-api-key": key, "anthropic-version": "2026-10-21"})
+            "model": model or AI_PROVIDERS["anthropic"]["model"], "max_tokens": 2048,
+            "output_config": {"effort": "low"},
+            "messages": [{"role": "user", "content": content}]},
+            {"x-api-key": key, "anthropic-version": "2026-10-21"})
+        u = out.get("usage") or {}
+        usage.update({"in": u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0), "out": u.get("output_tokens", 0)})
         if out.get("stop_reason") == "refusal":
             raise IOError("Claude declined to read it")
         return " ".join(b.get("text", "") for b in out.get("content") or [] if b.get("type") == "text")
     if provider == "google":
         parts = ([{"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}] if img_b64 else []) + [{"text": prompt}]
         out = _post_json("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" %
-                         quote(model or AI_PROVIDERS["google"]["model"]), {"contents": [{"parts": parts}]},
+                         urllib.parse.quote(model or AI_PROVIDERS["google"]["model"]), {"contents": [{"parts": parts}]},
                          {"x-goog-api-key": key})
-        return " ".join(pt.get("text", "") for c in out.get("candidates") or [] for pt in (c.get("content") or {}).get("parts") or [])
+        u = out.get("usageMetadata") or {}
+        usage.update({"in": u.get("promptTokenCount", 0), "out": u.get("candidatesTokenCount", 0)})
+        return " ".join(p.get("text", "") for c in out.get("candidates") or [] for p in (c.get("content") or {}).get("parts") or [])
     if provider == "openai":
         content = [{"type": "text", "text": prompt}] + ([{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + img_b64}}]
                                                        if img_b64 else [])
         out = _post_json("https://api.openai.com/v1/chat/completions", {
             "model": model or AI_PROVIDERS["openai"]["model"], "messages": [{"role": "user", "content": content}]},
             {"Authorization": "Bearer " + key})
+        u = out.get("usage") or {}
+        usage.update({"in": u.get("prompt_tokens", 0), "out": u.get("completion_tokens", 0)})
         return ((out.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
     raise ValueError("Unknown provider")
+
+
+def read_date_direct(provider, key, model, img_b64):
+    return ai_direct(provider, key, model, DATE_PROMPT, img_b64)
 
 
 def ai_ask(prompt, img=None, task="Dads Army"):
@@ -1634,11 +1811,21 @@ def ai_ask(prompt, img=None, task="Dads Army"):
         key = c["keys"].get(c["provider"])
         if not key:
             raise ApiError(400, "Add your %s API key in HQ → Scanning" % AI_PROVIDERS[c["provider"]]["name"])
-        try:
-            reply = ai_direct(c["provider"], key, c["model"], prompt, base64.b64encode(img).decode("ascii") if img else None)
-        except (urllib.error.URLError, IOError, ValueError) as e:
-            raise ApiError(502, "%s couldn't read it: %s" % (AI_PROVIDERS[c["provider"]]["name"], str(getattr(e, "reason", e))[:150]))
-        return reply, c["provider"]
+        ai_limit_check(c)
+        model = c["model"] or AI_PROVIDERS[c["provider"]]["model"]
+        for attempt in (1, 2):
+            usage = {}
+            try:
+                reply = ai_direct(c["provider"], key, c["model"], prompt, base64.b64encode(img).decode("ascii") if img else None, usage)
+                record_ai(c["provider"], model, task, usage, True)
+                return reply, c["provider"]
+            except (urllib.error.URLError, IOError, ValueError) as e:
+                msg = str(getattr(e, "reason", e))
+                record_ai(c["provider"], model, task, usage, False, friendly_ai_error(c["provider"], msg))
+                if attempt == 1 and ("503" in msg or "529" in msg or "overloaded" in msg.lower()):
+                    time.sleep(2)   # busy: one more go
+                    continue
+                raise ApiError(502, friendly_ai_error(c["provider"], msg))
     ents = ai_task_entities()
     if not ents:
         raise ApiError(400, "Set up an AI in Home Assistant, or add an API key in HQ → Scanning")
@@ -1656,17 +1843,25 @@ def ai_ask(prompt, img=None, task="Dads Army"):
             if name:
                 req["attachments"] = [{"media_content_id": "media-source://media_source/local/%s/%s" % (os.path.basename(SCAN_DIR), name),
                                        "media_content_type": "image/jpeg"}]
-            status, out = ha_request("POST", "/services/ai_task/generate_data?return_response", req, timeout=60)
-            if status == 200 and isinstance(out, dict):
-                return str((out.get("service_response") or {}).get("data") or ""), ent
-            errors.append("%s: %s" % (ent, (out.get("message") if isinstance(out, dict) else str(out))[:80] if out else status))
+            for attempt in (1, 2):
+                status, out = ha_request("POST", "/services/ai_task/generate_data?return_response", req, timeout=60)
+                if status == 200 and isinstance(out, dict):
+                    record_ai(ent, "", task, {}, True)
+                    return str((out.get("service_response") or {}).get("data") or ""), ent
+                msg = (out.get("message") if isinstance(out, dict) else str(out or status)) or str(status)
+                record_ai(ent, "", task, {}, False, friendly_ai_error(ent, msg))
+                if attempt == 1 and ("503" in msg or "high demand" in msg.lower() or "overloaded" in msg.lower()):
+                    time.sleep(2)   # busy: one more go before trying the next AI
+                    continue
+                break
+            errors.append(friendly_ai_error(ent, msg))
     finally:
         if path:
             try:
                 os.remove(path)
             except OSError:
                 pass
-    raise ApiError(502, "The AI couldn't answer (%s)" % "; ".join(errors)[:200])
+    raise ApiError(502, " ".join(errors)[:300])
 
 
 def translate_name(name):
@@ -2016,7 +2211,10 @@ def api_scan_ai_get(body, query):
         ents = ai_task_entities()
     except Exception:
         ents = []
+    recent = [dict(r) for r in DB.execute("SELECT ts, ai, model, task, tokens_in, tokens_out, cost_usd, ok, note FROM ai_calls "
+                                          "ORDER BY id DESC LIMIT 15")]
     return {"provider": c["provider"], "model": c["model"], "keys_set": sorted(c["keys"]), "ha_entities": ents,
+            "limit_usd": c["limit_usd"], "month": month_spend(), "stats": ai_stats(), "recent": recent,
             "providers": dict((k, {"name": v["name"], "model": v["model"]}) for k, v in AI_PROVIDERS.items())}
 
 
@@ -2033,6 +2231,8 @@ def api_scan_ai_put(body, query):
         if m and not re.fullmatch(r"[A-Za-z0-9._:/-]+", m):
             raise ApiError(400, "That isn't a model name")
         raw["model"] = m
+    if "limit_usd" in body:
+        raw["limit_usd"] = round(clean_num(body.get("limit_usd"), 0, 0, 1000, "Monthly limit"), 2)
     for prov in ("anthropic", "google", "openai"):
         k = "key_" + prov
         if k in body:
@@ -3001,8 +3201,8 @@ def api_backup(body, query):
         for r in DB.execute("SELECT item_id, ts, qty FROM usage ORDER BY id"):
             used.setdefault(r["item_id"], []).append([r["ts"], r["qty"]])
         codes = {}
-        for r in DB.execute("SELECT code, item_id FROM barcodes ORDER BY code"):
-            codes.setdefault(r["item_id"], []).append(r["code"])
+        for r in DB.execute("SELECT code, item_id, product FROM barcodes ORDER BY code"):
+            codes.setdefault(r["item_id"], []).append({"code": r["code"], "product": r["product"]})
         for it in items:
             it["usage"] = used.get(it["id"], [])
             it["barcodes"] = codes.get(it["id"], [])
@@ -3038,8 +3238,11 @@ def api_restore(body, query):
         if not isinstance(it, dict):
             raise ApiError(400, "Backup file is damaged")
         data = clean_item(it)
-        data["_barcodes"] = [c for c in (it.get("barcodes") if isinstance(it.get("barcodes"), list) else [])[:50]
-                             if clean_barcode(c, required=False)]   # 1.12.0 on
+        data["_barcodes"] = []   # 1.12.0 on: codes, or {"code", "product"}; a damaged one is skipped
+        for c in (it.get("barcodes") if isinstance(it.get("barcodes"), list) else [])[:50]:
+            code = safe_barcode(c.get("code") if isinstance(c, dict) else c)
+            if code:
+                data["_barcodes"].append((code, clean_text(c.get("product"), 160) if isinstance(c, dict) else ""))
         bl = []
         batches = it.get("batches") or []
         if not isinstance(batches, list):
@@ -3049,7 +3252,7 @@ def api_restore(body, query):
                 q = clean_num(b.get("qty"), 0, 0, 1e7)
                 if q > 0:
                     bl.append((q, clean_date(b.get("expiry")), clean_text(b.get("location"), 80),
-                               clean_text(b.get("added_at"), 30) or now_iso()))
+                               clean_text(b.get("added_at"), 30) or now_iso(), clean_date(b.get("opened_at"))))
         used = []   # 1.11.0 on: what was used when
         for u in (it.get("usage") if isinstance(it.get("usage"), list) else [])[-2000:]:
             if isinstance(u, list) and len(u) == 2 and isinstance(u[0], str) and DATE_RE.match(u[0][:10]):
@@ -3106,7 +3309,11 @@ def api_restore(body, query):
     except Exception as e:
         raise ApiError(500, "Couldn't save a copy of what you have now, so nothing was restored (%s)" % e)
     ts = now_iso()
+    has_codes = any(isinstance(it, dict) and "barcodes" in it for it in items)
     with tx() as db:
+        # A backup from before 1.12.0 has no barcodes: keep yours, matched back up to the items by name.
+        kept_codes = [] if has_codes else [dict(r) for r in db.execute(
+            "SELECT b.code, b.product, b.added_at, lower(i.name) AS name FROM barcodes b JOIN items i ON i.id = b.item_id")]
         db.execute("DELETE FROM batches")
         db.execute("DELETE FROM items")
         db.execute("DELETE FROM shopping")
@@ -3119,17 +3326,23 @@ def api_restore(body, query):
         ctx, rows = starter_ctx(get_settings()), starter_rows()
         for data, created, bl, used, starter in clean_items:
             new_id = insert_item(db, data, created, ts)
-            for q, exp, loc, added in bl:
-                db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at) VALUES (?, ?, ?, ?, ?)",
-                           (new_id, q, exp, loc, added))
+            for q, exp, loc, added, opened in bl:
+                db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at, opened_at) VALUES (?, ?, ?, ?, ?, ?)",
+                           (new_id, q, exp, loc, added, opened))
             for when, q in used:
                 db.execute("INSERT INTO usage(item_id, ts, qty) VALUES (?, ?, ?)", (new_id, when, q))
-            for code in data.get("_barcodes") or []:
+            for code, product in data.get("_barcodes") or []:
                 db.execute("INSERT OR REPLACE INTO barcodes(code, item_id, product, added_at) VALUES (?, ?, ?, ?)",
-                           (clean_barcode(code), new_id, "", ts))
+                           (code, new_id, product, ts))
             name, auto = starter if starter is not None else guess_starter(data["name"], data["target_qty"], ctx, rows)
             if name:
                 db.execute("UPDATE items SET starter = ?, auto_target = ? WHERE id = ?", (name, auto, new_id))
+        if kept_codes:
+            by_name = dict((r["name"].lower(), r["id"]) for r in db.execute("SELECT id, name FROM items"))
+            for c in kept_codes:
+                if c["name"] in by_name:
+                    db.execute("INSERT OR REPLACE INTO barcodes(code, item_id, product, added_at) VALUES (?, ?, ?, ?)",
+                               (c["code"], by_name[c["name"]], c["product"], c["added_at"]))
         for s in shopping:
             if isinstance(s, dict) and clean_text(s.get("text"), 200):
                 db.execute("INSERT INTO shopping(text, done, created_at) VALUES (?, ?, ?)",
@@ -3187,6 +3400,22 @@ def check_backup(path):
         conn.close()
 
 
+def scrub_secrets(con):
+    """API keys stay out of backup copies (they go into Home Assistant's backups too): paste them in again after a restore."""
+    con.execute("PRAGMA secure_delete = ON")   # overwrite the old values, not just unlink them
+    row = con.execute("SELECT value FROM settings WHERE key = 'scan_ai'").fetchone()
+    if row:
+        try:
+            raw = json.loads(row[0])
+            if isinstance(raw, dict) and raw.get("keys"):
+                raw["keys"] = {}
+                con.execute("UPDATE settings SET value = ? WHERE key = 'scan_ai'", (json.dumps(raw),))
+        except ValueError:
+            pass
+    con.commit()
+    con.execute("VACUUM")   # and no old copies left in free pages
+
+
 def make_backup(tag="auto"):
     """Copy the database to a new, dated file. The copy is written under a temporary name and checked;
     only then is it given its real name, and only then are old copies cleared out. A name that's
@@ -3199,6 +3428,7 @@ def make_backup(tag="auto"):
             dest = sqlite3.connect(tmp)
             try:
                 DB.backup(dest)
+                scrub_secrets(dest)
                 dest.execute("PRAGMA journal_mode = DELETE")   # one self-contained file, no -wal beside it
             finally:
                 dest.close()
@@ -3349,6 +3579,14 @@ def ha_entities(s):
     put("sensor.dads_army_hold_out", s["hold_out_days"], "Dads Army hold-out", "mdi:shield-home", "days", {
         "food_days": s["food_days"], "water_days": s["water_days"], "runs_out_first": s["runs_out_first"],
         "target_days": s["target_days"], "target_met": target_met, "people": s["people"]})
+    try:
+        ai = ai_stats()
+        put("sensor.dads_army_ai_spend", round(ai["cost_usd"], 4), "Dads Army AI spend this month", "mdi:robot-outline", "USD", {
+            "ai_answers": ai["ok"], "failed": ai["failed"], "today_answers": ai["today"]["ok"], "today_usd": round(ai["today"]["cost_usd"], 4),
+            "limit_usd": ai["limit_usd"] or None, "left_usd": ai["left_usd"], "last_month_usd": round(ai["last_month"]["cost_usd"], 4),
+            "dates_read": ai["tasks"]["dates"], "labels_read": ai["tasks"]["labels"], "since": ai["since"]})
+    except sqlite3.Error:
+        pass
     put("sensor.dads_army_food_days", s["food_days"], "Dads Army food", "mdi:food-drumstick", "days")
     put("sensor.dads_army_water_days", s["water_days"], "Dads Army water", "mdi:water", "days")
     put("sensor.dads_army_kit_stocked", s["kit_stocked_pct"], "Dads Army kit stocked", "mdi:toolbox", "%")
@@ -7254,6 +7492,7 @@ def main():
     threading.Thread(target=backup_loop, name="backups", daemon=True).start()
     threading.Thread(target=history_loop, name="history", daemon=True).start()
     threading.Thread(target=offline_loop, name="offline-barcodes", daemon=True).start()
+    sweep_scan_photos()
     threading.Thread(target=warnings_loop, name="warnings", daemon=True).start()
     if HA_TOKEN:
         threading.Thread(target=home_sensors_loop, name="home-sensors", daemon=True).start()

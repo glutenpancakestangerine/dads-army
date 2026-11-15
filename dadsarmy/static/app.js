@@ -2274,17 +2274,28 @@
   // ------------------------------------------------------------------
   function openSheet(s) {
     stack.push(s);
-    try { history.pushState({ daSheet: stack.length }, ''); } catch (e) { /* ignore */ }
+    // Straight after closing one (a result replacing the sheet you were on): reuse its step in history.
+    if (backSoon) { clearTimeout(backSoon); backSoon = null; try { history.replaceState({ daSheet: stack.length }, ''); } catch (e) { /* ignore */ } }
+    else { try { history.pushState({ daSheet: stack.length }, ''); } catch (e) { /* ignore */ } }
     showSheet(true);
+  }
+  // Going back in history is asynchronous, so a sheet opened straight after closing one would be popped by
+  // the late popstate. Close the sheet now, step history back a moment later, and ignore that popstate.
+  var ownPops = 0, ownPopAt = 0, backSoon = null;
+  function stepBack(n) {
+    ownPops++; ownPopAt = Date.now();
+    try { if (n > 1) history.go(-n); else history.back(); } catch (e) { ownPops--; }
   }
   function closeSheet() {
     if (!stack.length) return;
-    if (history.state && history.state.daSheet) history.back();
-    else { stack.pop(); showSheet(true); }
+    var hs = history.state && history.state.daSheet;
+    stack.pop();
+    showSheet(true);
+    if (hs) backSoon = setTimeout(function () { backSoon = null; stepBack(1); }, 0);
   }
   // Close every open sheet at once (each was a step in history), then carry on.
   // Saved: back to where you were. After a scan, that's the stores, not the scan result you came from.
-  var SCAN_SHEETS = ['livescan', 'scanned', 'scanhit', 'scanfail', 'scancode'];
+  var SCAN_SHEETS = ['livescan', 'scanned', 'scanhit', 'scanfail', 'scancode', 'scanpick'];
   function doneSheet() {
     if (stack.some(function (x) { return SCAN_SHEETS.indexOf(x.type) >= 0; })) closeAllSheets();
     else closeSheet();
@@ -2294,10 +2305,13 @@
     if (!n) return then && then();
     stack.length = 0;
     showSheet(true);
-    if (hs) { try { history.go(-Math.min(n, hs)); } catch (e) { /* fine */ } }
+    if (backSoon) { clearTimeout(backSoon); backSoon = null; n++; }
+    if (hs) stepBack(Math.min(n, hs));
     if (then) setTimeout(then, hs ? 150 : 0);
   }
   window.addEventListener('popstate', function () {
+    if (ownPops && Date.now() - ownPopAt < 1500) { ownPops--; return; }
+    ownPops = 0;
     if (stack.length) { stack.pop(); showSheet(true); }
     else if (SEL) { endSelect(); renderStoreList(); }
   });
@@ -2329,7 +2343,7 @@
       check: sheetCheck, plan: sheetPlan, warning: sheetWarning, warnset: sheetWarnSet, help: sheetHelp, dashwiz: sheetDashWiz,
       level: sheetLevel, levelhelp: sheetLevelHelp, homesensors: sheetHomeSensors, area: sheetArea, resall: sheetResAll,
       place: sheetPlace, live: sheetLive, scanned: sheetScanned, scancode: sheetScanCode, scanhit: sheetScanHit,
-      livescan: sheetLiveScan, scanfail: sheetScanFail
+      livescan: sheetLiveScan, scanfail: sheetScanFail, scanpick: sheetScanPick
     }[s.type](s);
     if (html === null) {   // the item was deleted elsewhere
       closeSheet();
@@ -2488,7 +2502,7 @@
     var i = info(it);
     var live = it.batches.filter(function (b) { return b.qty > 0; });
     var pick = live.length > 1 ? '<fieldset class="field use-batches"><legend>Which batch is it from?</legend><div class="opts">' + live.map(function (b, n) {
-        return '<label class="opt"><input type="radio" name="batch_id" value="' + b.id + '"' + (n === 0 ? ' checked' : '') + ' data-exp="' + esc(b.expiry || '') + '"><span>' +
+        return '<label class="opt"><input type="radio" name="batch_id" value="' + b.id + '"' + (n === 0 ? ' checked' : '') + ' data-exp="' + esc(b.printed_expiry || b.expiry || '') + '"><span>' +
           esc(b.expiry ? fmtDate(b.expiry) : 'No date') + ' · ' + esc(fq(b.qty)) + (b.location ? ' · ' + esc(b.location) : '') + (b.opened_at ? ' · opened' : '') +
           (n === 0 ? ' <small>(use first)</small>' : '') + '</span></label>';
       }).join('') + '</div><div class="date-row"><button type="button" class="btn small" data-act="scan-usebatch">📷 Match the date on it</button></div>' +
@@ -2563,7 +2577,9 @@
       var inp = document.createElement('input');
       inp.type = 'file'; inp.accept = 'image/*'; inp.setAttribute('capture', 'environment');
       inp.style.display = 'none';
-      inp.addEventListener('change', function () { ok(inp.files && inp.files[0]); inp.remove(); });
+      var done = function (f) { ok(f || null); if (inp.parentNode) inp.remove(); };
+      inp.addEventListener('change', function () { done(inp.files && inp.files[0]); });
+      inp.addEventListener('cancel', function () { done(null); });   // picker closed without a photo
       document.body.appendChild(inp);
       inp.click();
     });
@@ -2593,7 +2609,9 @@
   }
   function barcodeHints(Z) {
     var hints = new Map();
-    hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [Z.BarcodeFormat.EAN_13, Z.BarcodeFormat.EAN_8, Z.BarcodeFormat.UPC_A, Z.BarcodeFormat.UPC_E]);
+    hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [Z.BarcodeFormat.EAN_13, Z.BarcodeFormat.EAN_8, Z.BarcodeFormat.UPC_A, Z.BarcodeFormat.UPC_E,
+      Z.BarcodeFormat.RSS_14, Z.BarcodeFormat.RSS_EXPANDED, Z.BarcodeFormat.CODE_128, Z.BarcodeFormat.ITF]);
+    hints.set(Z.DecodeHintType.TRY_HARDER, true);
     return hints;
   }
   function scanBarcode(btn) {
@@ -2612,8 +2630,17 @@
       }, btn);
     });
   }
+  // DataBar and GS1-128 give "(01)05012345678900…": the product number is the 14 digits after 01.
+  function productCode(raw) {
+    var t = String(raw || '').replace(/[()\s]/g, '');
+    var m = /^01(\d{14})/.exec(t);
+    if (m) t = m[1];
+    if (/^\d{14}$/.test(t) && t.charAt(0) === '0') t = t.slice(1);
+    return t;
+  }
   function lookupBarcode(code, btn) {
-    if (!/^[0-9]{6,14}$/.test(code || '')) { toast('Barcodes are 8 to 13 digits', { error: true }); return; }
+    code = productCode(code);
+    if (!/^[0-9]{6,14}$/.test(code || '')) { toast('That isn\'t a product barcode. Try another, read the label, or choose from your stores.', { error: true }); return; }
     return run(function () {
       return api('GET', 'api/scan/barcode?code=' + encodeURIComponent(code)).then(function (r) {
         if (stack.length && stack[stack.length - 1].type === 'scancode') closeSheet();
@@ -2666,12 +2693,27 @@
       '<div class="scan-choice"><button class="btn primary block" data-act="scan-label-same">🤖 Read the label from this photo</button>' +
       '<button class="btn block" data-act="scan-label">📷 Take a photo of the front of the pack</button>' +
       '<button class="btn block" data-act="scan-photo">Try the barcode again</button>' +
-      '<button class="btn block" data-act="scan-type">🔢 Type the numbers</button></div>';
+      '<button class="btn block" data-act="scan-type">🔢 Type the numbers</button>' +
+      (S.items.length ? '<button class="btn block" data-act="scan-pick">📋 Choose from your stores</button>' : '') + '</div>';
+  }
+  // No barcode at all (a can from a multipack, say): pick the item, then put one in or take one out.
+  function sheetScanPick() {
+    return sheetHead('Choose from your stores', 'For things without a barcode', '📋') +
+      '<div class="search">' + ICON.search + '<input type="search" id="pickQ" placeholder="Search" autocomplete="off" data-autofocus aria-label="Search your stores"></div>' +
+      '<div class="list" id="pickList">' + pickRows('') + '</div>';
+  }
+  function pickRows(q) {
+    q = q.trim().toLowerCase();
+    return S.items.filter(function (it) { return !q || it.name.toLowerCase().indexOf(q) >= 0; }).sort(byName).slice(0, 60).map(function (it) {
+      return '<button class="li" data-act="scan-picked" data-id="' + it.id + '"><span class="li-ico">' + cat(it.category).icon + '</span><span class="li-main">' +
+        '<span class="li-title">' + esc(it.name) + '</span><span class="li-sub">' + esc(qu(info(it).total, it.unit)) + ' in stock</span></span>' + ICON.chev + '</button>';
+    }).join('') || '<p class="small muted">Nothing matches. Close this and use Add item.</p>';
   }
   function readLabel(img, btn, code) {
     return run(function () {
       toast('Reading the label…');
       return api('POST', 'api/scan/label', { image: img }).then(function (r) {
+        SCAN_AI = null;   // the spend figures have moved
         var top = stack.length && stack[stack.length - 1].type;
         if (top === 'scanfail' || (top === 'scanned' && code)) closeSheet();
         return openSheet({ type: 'scanned', code: code || '', product: r.product });   // a barcode stays with it
@@ -2683,7 +2725,7 @@
     return takePhoto().then(function (file) {
       if (!file) return;
       hint.hidden = false; hint.className = 'hint'; hint.textContent = 'Reading the date…';
-      return shrinkPhoto(file, 1280).then(function (img) { return api('POST', 'api/scan/date', { image: img }); }).then(function (r) {
+      return shrinkPhoto(file, 1280).then(function (img) { return api('POST', 'api/scan/date', { image: img }).then(function (r) { SCAN_AI = null; return r; }); }).then(function (r) {
         if (r.date) {
           input.value = r.date;
           hint.innerHTML = 'Read as <b>' + esc(fmtDate(r.date)) + '</b>. Check it\'s right before saving.';
@@ -2700,7 +2742,7 @@
     return takePhoto().then(function (file) {
       if (!file) return;
       hint.hidden = false; hint.className = 'hint'; hint.textContent = 'Reading the date…';
-      return shrinkPhoto(file, 1280).then(function (img) { return api('POST', 'api/scan/date', { image: img }); }).then(function (r) {
+      return shrinkPhoto(file, 1280).then(function (img) { return api('POST', 'api/scan/date', { image: img }).then(function (r) { SCAN_AI = null; return r; }); }).then(function (r) {
         var radios = $$('input[name="batch_id"]', fs);
         if (!r.date) { hint.className = 'hint err'; hint.textContent = 'Couldn\'t see a date. Pick the batch instead.'; return; }
         var t = parseYmd(r.date).getTime(), best = null, bestGap = Infinity;
@@ -2750,7 +2792,8 @@
       '<p class="small muted center" id="liveStatus" role="status">Starting the camera…</p>' +
       '<div class="btn-row live-alt"><button class="btn" data-act="scan-photo">📷 Take a photo instead</button>' +
       '<button class="btn" data-act="scan-label">🤖 No barcode? Read the label</button>' +
-      '<button class="btn" data-act="scan-type">🔢 Type the numbers</button></div>';
+      '<button class="btn" data-act="scan-type">🔢 Type the numbers</button>' +
+      (S.items.length ? '<button class="btn" data-act="scan-pick">📋 Choose from your stores</button>' : '') + '</div>';
   }
   function liveStatus(text, bad) {
     var el = $('#liveStatus');
@@ -2773,7 +2816,10 @@
           try { if (navigator.vibrate) navigator.vibrate(60); } catch (e) { /* no buzz */ }
           stopLive();
           liveStatus('Got ' + code);
-          lookupBarcode(code);   // opens on top: close it to scan the next one
+          // Opens on top: close it to scan the next one. Not a product barcode, or the lookup failed: keep scanning.
+          Promise.resolve(lookupBarcode(code)).then(function () {
+            if (!LIVE && stack.length && stack[stack.length - 1].type === 'livescan') setTimeout(startLive, 1200);
+          });
         }).then(function () {
           if (!mine()) return;
           var st = v.srcObject, tr = st && st.getVideoTracks && st.getVideoTracks()[0];
@@ -2821,7 +2867,44 @@
       '<p class="small muted">Barcodes are read on this phone and looked up in Open Food Facts (only the barcode is sent). Best before dates, and labels without a barcode, are read from a photo by an AI: about 0.1p a photo.</p>' +
       '<div class="field"><span>Who reads the photos</span><select data-scanai="provider" aria-label="Who reads the photos">' +
       Object.keys(P).map(function (k) { return '<option value="' + k + '"' + (k === prov ? ' selected' : '') + '>' + esc(P[k].name) + (k !== 'ha' && c.keys_set.indexOf(k) >= 0 ? ' (key saved)' : '') + '</option>'; }).join('') +
-      '</select></div>' + keyBox + offlineBox() + '</section>';
+      '</select></div>' + keyBox + spendBox(c) + offlineBox() + '</section>';
+  }
+  // What the AI has cost: this month, today, what's left of the limit, and the last few calls.
+  function usd(v) { return v == null ? 'not priced' : '$' + (v < 0.01 && v > 0 ? v.toFixed(4) : v.toFixed(2)); }
+  function spendBox(c) {
+    var st = c.stats, lim = c.limit_usd || 0;
+    if (!st) return '';
+    var pct = lim ? Math.min(100, Math.round(100 * st.cost_usd / lim)) : 0;
+    var tile = function (val, label, state) {
+      return '<div class="stat"' + (state ? ' data-state="' + state + '"' : '') + '><span class="stat-val">' + esc(val) + '</span><span class="stat-lbl">' + esc(label) + '</span></div>';
+    };
+    var rows = (c.recent || []).map(function (r) {
+      return '<tr><td>' + esc(fmtDate(r.ts.slice(0, 10))) + ' ' + esc(r.ts.slice(11, 16)) + '</td><td>' + esc(r.task.replace('Dads Army ', '')) + '</td>' +
+        '<td>' + esc(r.model || r.ai.replace('ai_task.', '')) + '</td><td>' + (r.tokens_in || r.tokens_out ? r.tokens_in + ' / ' + r.tokens_out : '–') + '</td>' +
+        '<td>' + (r.ok ? esc(usd(r.cost_usd)) : '<span class="err" title="' + esc(r.note) + '">failed</span>') + '</td></tr>';
+    }).join('');
+    return '<h3>AI use and spending</h3><div class="stats">' +
+      tile(usd(st.cost_usd), lim ? 'spent of $' + lim.toFixed(2) : 'spent this month', lim && st.cost_usd >= lim ? 'bad' : lim && pct >= 80 ? 'warn' : '') +
+      tile(String(st.ok), 'AI answers this month') +
+      tile(String(st.today.ok), 'today (' + usd(st.today.cost_usd) + ')') +
+      (lim ? tile(usd(st.left_usd), 'left this month', st.left_usd <= 0 ? 'bad' : '') : tile(usd(st.last_month.cost_usd), 'last month')) +
+      '</div>' + (lim ? '<div class="ai-meter"><span style="width:' + pct + '%"></span></div>' : '') +
+      '<p class="small muted">' + [
+        st.tasks.dates ? st.tasks.dates + ' best before date' + (st.tasks.dates === 1 ? '' : 's') : '',
+        st.tasks.labels ? st.tasks.labels + ' label' + (st.tasks.labels === 1 ? '' : 's') : '',
+        st.tasks.other ? st.tasks.other + ' other (names translated)' : '',
+        st.failed ? st.failed + ' failed' : '',
+        st.avg_usd != null ? 'about ' + usd(st.avg_usd) + ' each' : '',
+        (st.tokens_in + st.tokens_out) + ' tokens'
+      ].filter(Boolean).join(' · ') + '. In Home Assistant: sensor.dads_army_ai_spend.' +
+      (c.provider === 'ha' ? ' Through Home Assistant\'s AI Task the cost isn\'t known here: check your AI provider\'s own page.' : '') + '</p>' +
+      '<div class="field"><span>Monthly limit (US dollars)</span>' +
+      '<input type="text" inputmode="decimal" autocomplete="off" data-scanai="limit_usd" value="' + (lim || '') + '" placeholder="No limit, e.g. 1">' +
+      '<div class="hint">Once this month\'s spend reaches it, nothing more is sent to Claude, Gemini or OpenAI with your API key until the 1st. ' +
+      'Costs are worked out here from each call\'s tokens and the provider\'s list price (an unknown model is counted on the high side). ' +
+      'The limit doesn\'t cover the Home Assistant AI Task route, which is billed there.</div></div>' +
+      (rows ? '<details class="ai-calls"><summary>Recent AI calls</summary><div class="table-wrap"><table class="ai-table"><thead><tr><th>When</th><th>What</th><th>Model</th><th>Tokens in / out</th><th>Cost</th></tr></thead><tbody>' +
+        rows + '</tbody></table></div></details>' : '');
   }
   // The offline barcode list: on/off, how it's doing, and Update now.
   var OFFLINE_ST = null, offlineTimer = null;
@@ -2867,7 +2950,7 @@
     var v = t.value.trim();
     if (k.indexOf('key_') === 0 && !v) return;   // an empty box never clears a saved key
     var b = {};
-    b[k] = v;
+    b[k] = k === 'limit_usd' ? (parseFloat(v) || 0) : v;
     if (k === 'provider') b.model = '';         // each provider has its own default model
     saveScanAi(b);
   });
@@ -3041,6 +3124,11 @@
       case 'scan-type':
         stopLive();
         return openSheet({ type: 'scancode' });
+      case 'scan-pick':
+        stopLive();
+        return openSheet({ type: 'scanpick' });
+      case 'scan-picked':
+        return openSheet({ type: 'scanhit', id: id });
       case 'scan-torch':
         return toggleTorch(a);
       case 'scan-code':
@@ -3668,6 +3756,7 @@
   document.addEventListener('input', function (e) {
     var t = e.target;
     if (t.id === 'q') { F.q = t.value; renderStoreList(); return; }
+    if (t.id === 'pickQ') { var pl = $('#pickList'); if (pl) pl.innerHTML = pickRows(t.value); return; }
     if (t.dataset.calc) {
       var f = t.form;
       var per = num($('[data-calc="per100"]', f).value), g = num($('[data-calc="grams"]', f).value);

@@ -17,13 +17,35 @@ class TestBarcodes(AppTest):
         self.assertEqual(server.api_scan_barcode({}, {"code": ["5010251605466"]})["item_id"], beans)
         self.assertApiError(404, server.api_scan_link, {"code": "5010251605467", "item_id": 999999}, {})
         backup = json.loads(server.api_backup({}, {}).data.decode("utf-8"))
-        self.assertEqual(sorted(c for it in backup["items"] for c in it["barcodes"]), ["5000157024671", "5010251605466"])
+        self.assertEqual(sorted(c["code"] for it in backup["items"] for c in it["barcodes"]), ["5000157024671", "5010251605466"])
         server.api_restore(backup, {})
         beans_now = [it for it in server.all_items() if it["name"] == "Baked beans"][0]["id"]
         self.assertEqual(server.api_scan_barcode({}, {"code": ["5010251605466"]})["item_id"], beans_now)
         server.api_item_delete({}, {}, str(beans_now))   # the item's barcodes go with it
         server.OFF_CACHE["5010251605466"] = None          # (and Open Food Facts doesn't know it)
         self.assertIsNone(server.api_scan_barcode({}, {"code": ["5010251605466"]})["item_id"])
+
+    def test_barcodes_come_back_with_undo_and_older_backups(self):
+        rice = self.add("Rice", 1, unit="bag", barcode="5000157024671", product="Rice")
+        res = server.api_item_delete({}, {}, str(rice))
+        server.api_restore_item(res["undo"], {})
+        self.assertEqual(server.api_scan_barcode({}, {"code": ["5000157024671"]})["item_id"], rice)
+        # A backup from before barcodes: the ones you have stay, matched up by name.
+        old = json.loads(server.api_backup({}, {}).data.decode("utf-8"))
+        for it in old["items"]:
+            it.pop("barcodes", None)
+        server.api_restore(old, {})
+        rice = [it for it in server.all_items() if it["name"] == "Rice"][0]["id"]
+        self.assertEqual(server.api_scan_barcode({}, {"code": ["5000157024671"]})["item_id"], rice)
+        # Product names come back too, and one damaged barcode doesn't stop the restore.
+        b = json.loads(server.api_backup({}, {}).data.decode("utf-8"))
+        self.assertEqual(b["items"][0]["barcodes"], [{"code": "5000157024671", "product": "Rice"}])
+        b["items"][0]["barcodes"].append("not-a-code")
+        server.api_restore(b, {})
+        # A 12-digit UPC-A and the same code with a 0 in front are one barcode.
+        rice = [it for it in server.all_items() if it["name"] == "Rice"][0]["id"]
+        server.api_scan_link({"code": "012345678905", "item_id": rice}, {})
+        self.assertEqual(server.api_scan_barcode({}, {"code": ["0012345678905"]})["item_id"], rice)
 
     def test_open_food_facts(self):
         sample = {"product": {"product_name": "Baked Beans in Tomato Sauce", "brands": "Heinz,Kraft Heinz", "quantity": "415 g",
@@ -67,6 +89,26 @@ class TestPacks(AppTest):
         res = server.api_use({"qty": 0.25}, {}, str(rice))
         server.api_restore_item(res["undo"], {})
         self.assertEqual([(b["qty"], bool(b["opened_at"])) for b in self.item(rice)["batches"]], [(0.5, True)])
+
+    def test_cans_from_multipacks_add_up(self):
+        cola = self.add("Cola", 3, category="water", unit="pack", pack_size=6, pack_unit="each")
+        for _ in range(6):   # one can at a time, as the app sends it
+            server.api_use({"qty": round(1 / 6.0, 3)}, {}, str(cola))
+        self.assertEqual([(b["qty"], b["opened_at"]) for b in self.item(cola)["batches"]], [(2, None)])   # not 1 + 0.998
+        tuna = self.add("Tuna", 1, unit="pack", pack_size=3, pack_unit="each")
+        for _ in range(3):
+            server.api_use({"qty": round(1 / 3.0, 3)}, {}, str(tuna))
+        self.assertEqual(self.item(tuna)["batches"], [])   # nothing tiny left over
+
+    def test_restore_keeps_an_opened_pack(self):
+        beans = self.add("Beans", 2, days_from_today(300), unit="tin", pack_size=400, pack_unit="g", open_days=3)
+        server.api_use({"qty": 0.5}, {}, str(beans))
+        server.api_restore(json.loads(server.api_backup({}, {}).data.decode("utf-8")), {})
+        beans = [it for it in server.all_items() if it["name"] == "Beans"][0]
+        self.assertEqual(sorted((b["qty"], bool(b["opened_at"])) for b in beans["batches"]), [(0.5, True), (1, False)])
+        # Home Assistant sees the opened tin go off at its "use within 3 days", not its best before.
+        opened = [b for b in server.open_dated(server.all_items())[0]["batches"] if b["opened_at"]][0]
+        self.assertEqual(opened["expiry"], days_from_today(3))
 
     def test_use_from_the_batch_in_your_hand(self):
         soup = self.add("Soup", 2, days_from_today(100), unit="tin")
@@ -132,6 +174,42 @@ class TestAI(AppTest):
         self.assertEqual(server.api_scan_ai_get({}, {})["keys_set"], ["anthropic"])
         server.api_scan_ai_put({"key_anthropic": None, "provider": "ha"}, {})   # null removes it
         self.assertEqual(server.api_scan_ai_get({}, {})["keys_set"], [])
+
+    def test_keys_stay_out_of_database_copies(self):
+        key = "sk-ant-api03-" + "Z9y8X7w6" * 6
+        server.api_scan_ai_put({"key_anthropic": key}, {})
+        path = server.make_backup("test")
+        with open(path, "rb") as f:
+            self.assertNotIn(key.encode(), f.read())
+        self.assertEqual(server.api_scan_ai_get({}, {})["keys_set"], ["anthropic"])   # still there to use
+
+    def test_spend_and_monthly_limit(self):
+        server.DB.execute("DELETE FROM ai_calls")
+        server.record_ai("anthropic", "claude-haiku-5-5", "Dads Army best before", {"in": 1500, "out": 40}, True)
+        server.record_ai("anthropic", "claude-haiku-5-5", "Dads Army label", {"in": 1600, "out": 200}, False, "busy")
+        server.record_ai("ai_task.google_ai_task", "", "Dads Army best before", {}, True)
+        server.record_ai("openai", "some-new-model", "Dads Army label", {"in": 1000, "out": 100}, True)
+        st = server.ai_stats()
+        self.assertEqual((st["calls"], st["ok"], st["failed"], st["tasks"]["dates"], st["tasks"]["labels"]), (4, 3, 1, 2, 1))
+        # Tokens are costed even on a failed call; Home Assistant's AI Task isn't costed here; an unknown
+        # model is costed on the high side, so the limit still stops it.
+        want = (1500 * 0.10 + 40 * 0.50 + 1600 * 0.10 + 200 * 0.50) / 1e6 + (1000 * 3.0 + 100 * 15.0) / 1e6
+        self.assertAlmostEqual(st["cost_usd"], want, places=9)
+        server.ai_limit_check({"limit_usd": 0})
+        server.ai_limit_check({"limit_usd": 1.0})
+        self.assertApiError(402, server.ai_limit_check, {"limit_usd": 0.0001})
+        server.api_scan_ai_put({"limit_usd": 5}, {})
+        self.assertEqual(server.api_scan_ai_get({}, {})["stats"]["limit_usd"], 5.0)
+
+    def test_errors_in_plain_words(self):
+        f = server.friendly_ai_error
+        self.assertIn("busy right now", f("ai_task.google_ai_task", '{"error": {"code": 503, "message": "high demand"}}'))
+        self.assertIn("no credit left", f("ai_task.openai_ai_task", "Insufficient funds"))
+        self.assertIn("allowance is used up", f("google", "HTTP 429: RESOURCE_EXHAUSTED quota"))
+        self.assertIn("didn't accept the API key", f("anthropic", "HTTP 401: invalid x-api-key"))
+        self.assertIn("took too long", f("google", "The read operation timed out"))
+        self.assertTrue(f("google", "error id 15030").startswith("Gemini couldn't answer"))
+        self.assertNotIn("abcdef123456", f("openai", "Incorrect key: sk-abcdef123456****"))
 
 
 class TestOfflineList(AppTest):
