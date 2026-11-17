@@ -726,10 +726,91 @@
       '<div class="btn-row"><button class="btn small" data-act="stock-review">🤖 Review again</button>' +
       '<span class="small muted">' + (when ? 'Reviewed ' + esc(when.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })) + ' · ' : '') + srN(v.items || 0, 'item', 'items') + ' looked at</span></div></section>';
   }
+  // ------------------------------------------------------------------
+  // The daily briefing (1.15.0): one paragraph at 6am on what to be aware of, locally, across the UK and in the world.
+  // ------------------------------------------------------------------
+  var BRIEF_STATE = { 1: 'good', 2: 'good', 3: 'warn', 4: 'bad', 5: 'bad' };
+  var briefTimer = null;
+  function safeHref(u) { return /^https?:\/\/[^\s"'<>]+$/.test(u || '') ? u : ''; }
+  function briefWhen(b) {
+    var d = new Date(b.made_at), today = new Date().toISOString().slice(0, 10);
+    var t = isNaN(d) ? '' : d.toLocaleTimeString('en-GB', { hour: 'numeric', minute: '2-digit' });
+    return (b.day === today ? 'Today' : fmtDate(b.day)) + (t ? ', ' + t : '');
+  }
+  function briefChip(B, b, k, label) {
+    var n = (b.levels || {})[k];
+    if (!n) return '';
+    var vs = (b.vs_usual || {})[k];
+    return '<span class="brief-chip" data-state="' + (BRIEF_STATE[n] || 'good') + '"><b>' + esc(label) + '</b> ' + esc(B.levels[n] || n) +
+      (vs && vs !== 'same' ? ' <span class="brief-vs">' + (vs === 'higher' ? '↑ above usual' : '↓ below usual') + '</span>' : '') + '</span>';
+  }
+  function briefCard() {
+    var B = S.briefing;
+    if (!B || !B.config.on || !B.available) return '';
+    var b = B.latest;
+    clearTimeout(briefTimer);
+    if (B.busy) briefTimer = setTimeout(function () { refresh(); }, 8000);
+    var head = '<div class="card-head"><h2>Daily briefing</h2>' + (b ? '<span class="small muted">' + esc(briefWhen(b)) + '</span>' : '') + '</div>';
+    if (!b) {
+      return '<section class="card brief-card">' + head + '<p class="small muted">' +
+        (B.busy ? 'Writing your first briefing: searching the news. This takes a minute or two…' : B.error ? esc(B.error) : 'Your first briefing comes at ' + B.hour + 'am.') + '</p></section>';
+    }
+    var stale = b.day !== new Date().toISOString().slice(0, 10) && new Date().getHours() >= B.hour;
+    var src = (b.sources || []).map(function (x) {
+      var u = safeHref(x.url);
+      return u ? '<li><a href="' + esc(u) + '" target="_blank" rel="noopener noreferrer">' + esc(x.title) + '</a></li>' : '';
+    }).join('');
+    return '<section class="card brief-card">' + head +
+      '<div class="brief-chips">' + briefChip(B, b, 'local', 'Local') + briefChip(B, b, 'national', 'UK') + briefChip(B, b, 'global', 'World') + '</div>' +
+      '<p class="brief-text">' + esc(b.text) + '</p>' +
+      (B.busy ? '<p class="small muted">Writing a new one…</p>' : stale && B.error ? '<p class="small err">Today\'s didn\'t come through: ' + esc(B.error) + '</p>' : '') +
+      (src ? '<details class="brief-src"><summary>Sources (' + (b.sources || []).length + ')' + (b.searched && b.searched.length ? ' and searches' : '') + '</summary><ul>' + src + '</ul>' +
+        (b.searched && b.searched.length ? '<p class="small muted">Searched: ' + b.searched.map(esc).join(' · ') + '</p>' : '') + '</details>' : '') +
+      '<p class="small muted brief-foot">Written by AI from the news and Dads Army\'s live data. Check anything important with the official source.</p></section>';
+  }
+  // HQ: switch it on, choose how thorough, and where "local" is.
+  function briefHqCard() {
+    var B = S.briefing;
+    if (!B) return '';
+    var c = B.config;
+    var html = '<section class="card" id="briefCard"><div class="card-head"><h2>Daily briefing</h2>' + (c.on && B.available ? pill('good', 'On') : pill('plain', 'Off')) + '</div>' +
+      '<p class="small muted">Every morning at ' + B.hour + 'am, Claude reads your warnings and the wider picture, searches the news, and writes one paragraph on threats and risks to be aware of: ' +
+      'locally, across the UK and in the world (weather, conflict, cyber, health, power, supply and more), compared with what\'s been usual lately. It\'s shown at the top of the Sitrep.</p>';
+    if (!B.available) {
+      return html + '<p class="small">Needs an Anthropic API key: choose <b>Anthropic Claude</b> under Scanning above and paste your key. (The news search runs on Anthropic\'s side, so the other AIs can\'t do this.)</p></section>';
+    }
+    html += '<label class="opt"><input type="checkbox" data-brief="on"' + (c.on ? ' checked' : '') + '><span><b>Daily briefing</b>' +
+      '<span class="small muted">Uses your Anthropic key and counts towards the monthly AI limit above.</span></span></label>' +
+      '<label class="field"><span>How thorough</span><select data-brief="model">' +
+      Object.keys(B.models).map(function (k) { return '<option value="' + k + '"' + (k === c.model ? ' selected' : '') + '>' + esc(B.models[k].name + ': ' + B.models[k].about) + '</option>'; }).join('') +
+      '</select></label>' +
+      '<label class="field"><span>Local news for</span><input type="text" data-brief="area" autocomplete="off" maxlength="60" value="' + esc(c.area) + '" placeholder="' + esc(B.area_auto) + '">' +
+      '<div class="hint">A town or county. Left empty, it\'s ' + esc(B.area_auto) + ' (your Met Office region). This name, the day\'s warnings and wider picture, and how long your stores last are sent to Anthropic.</div></label>';
+    if (c.on) {
+      var b = B.latest;
+      html += '<p class="small muted">' + (B.busy ? 'Writing one now…' : b ? 'Last one: ' + esc(briefWhen(b)) + ', ' + (b.searches || 0) + ' searches, ' + esc(usd(b.cost_usd)) + '.' : 'None yet.') + '</p>' +
+        (B.error ? '<p class="small ha-error">' + esc(B.error) + '</p>' : '') +
+        '<div class="btn-row"><button class="btn" data-act="brief-now"' + (B.busy ? ' disabled' : '') + '>Write one now</button></div>';
+    }
+    return html + '</section>';
+  }
+  function redrawBrief() { var el = $('#briefCard'); if (el) el.outerHTML = briefHqCard(); }
+  document.addEventListener('change', function (e) {
+    var t = e.target, k = t.dataset && t.dataset.brief;
+    if (!k) return;
+    var body = {};
+    body[k] = k === 'on' ? t.checked : t.value;
+    api('PUT', 'api/briefing', body).then(function (r) {
+      S.briefing = r; redrawBrief();
+      toast(k === 'on' ? (r.config.on ? (r.busy ? 'On: writing today\'s briefing now' : 'Daily briefing on') : 'Daily briefing off') : 'Saved');
+      if (r.busy) setTimeout(refresh, 8000);
+    }, function (err) { toast(err.message, { error: true }); if (k === 'on') t.checked = !t.checked; });
+  });
+
   function renderSitrep(el) {
-    if (!S.items.length) { el.innerHTML = levelCard() + warnCard(false) + liveCard() + emptyCard() + resilienceCard(); return; }
+    if (!S.items.length) { el.innerHTML = briefCard() + levelCard() + warnCard(false) + liveCard() + emptyCard() + resilienceCard(); return; }
     var st = S.settings, r = readiness(), target = st.target_days;
-    var html = levelCard() + dashNote() + warnCard(false) + liveCard() + resilienceCard();
+    var html = briefCard() + levelCard() + dashNote() + warnCard(false) + liveCard() + resilienceCard();
 
     // Hero: how long could we hold out?
     if (r.people === 0) {
@@ -1382,11 +1463,15 @@
   // Warnings: Met Office, floods, Emergency Alerts, GDACS, UKHSA, WHO
   // ------------------------------------------------------------------
   var WARN_ICON = { weather: '🌦️', flood: '🌊', alert: '📢', disaster: '🌍', fire: '🔥', news: '🩺',
-    river: '🏞️', power: '🔌', grid: '⚡', gas: '🔥', air: '🌫️', space: '☀️', money: '💷' };
+    river: '🏞️', power: '🔌', grid: '⚡', gas: '🔥', air: '🌫️', space: '☀️', money: '💷',
+    threat: '🛡️', cyber: '💻', drought: '💧', water: '🚰' };
   var SRC_NAME = { metoffice: 'Met Office', floods: 'Environment Agency', govalerts: 'GOV.UK', gdacs: 'GDACS', fires: 'NASA FIRMS',
     ukhsa: 'UKHSA', who: 'WHO', rivers: 'Environment Agency', power: 'Power networks', grid: 'NESO', gas: 'National Gas',
-    air: 'Defra UK-AIR', space: 'NOAA', pound: 'Bank of England' };
+    air: 'Defra UK-AIR', space: 'NOAA', pound: 'Bank of England', threat: 'MI5', cyber: 'NCSC', travel: 'FCDO',
+    drought: 'Environment Agency', water: 'Your water company', floodrisk: 'Flood Forecasting Centre', rain: 'Environment Agency',
+    ground: 'Environment Agency', gridnow: 'NESO / Elexon', gridstress: 'Elexon / NESO' };
   var LIVE_KEYS = ['rivers', 'power', 'grid', 'gas', 'air', 'space', 'pound'];
+  var LIVE_MORE = 'threat';   // 1.15.0's sources start here in the settings
   function W() {
     return S.warnings || { on: false, items: [], news: [], sources: {}, config: { sources: {} }, regions: [], source_list: [] };
   }
@@ -1518,6 +1603,54 @@
     } else if (key === 'space') {
       h += '<p>Now: <b>' + esc(r.text) + '</b>. Next three days: ' + esc(r.next_text.charAt(0).toLowerCase() + r.next_text.slice(1)) + '.</p>' +
         '<p class="small muted">Geomagnetic storms run from G1 (minor) to G5 (extreme). Severe ones (G4, G5) can upset satellite navigation, radio and, rarely, the power grid. Dads Army warns from G4.</p>';
+    } else if (key === 'threat') {
+      h += '<p>The UK national threat level is <b>' + esc(String(r.level || '').toLowerCase()) + '</b>: ' + esc(r.means || '') + '.' +
+        (r.ni ? ' Northern Ireland-related terrorism in Northern Ireland: ' + esc(String(r.ni).toLowerCase()) + '.' : '') + '</p>' +
+        '<p class="small muted">Set by the Joint Terrorism Analysis Centre and MI5. It\'s the same for everyone in Great Britain (Northern Ireland has its own as well), and isn\'t your household\'s alert level. ' +
+        'Dads Army warns when it goes up, and at critical.</p>';
+    } else if (key === 'cyber') {
+      h += (r.news || []).length ? '<div class="list">' + r.news.map(function (n) {
+        return '<a class="li news" href="' + esc(n.url) + '" target="_blank" rel="noopener noreferrer"><span class="li-main"><span class="li-title wrap">' + (n.urgent ? '⚠️ ' : '') + esc(n.title) + '</span>' +
+          '<span class="li-sub">' + esc(whenText(n.issued)) + '</span></span>' + ICON.chev + '</a>';
+      }).join('') + '</div>' : '<p class="small muted">Nothing from the NCSC in the last two weeks.</p>';
+      h += '<p class="small muted">The National Cyber Security Centre\'s news. A critical flaw or live attack in the last three days is a warning: update your phones, computers and router.</p>';
+    } else if (key === 'travel') {
+      h += (r.changes || []).length ? '<div class="list">' + r.changes.map(function (c) {
+        return '<a class="li news" href="' + esc(c.url) + '" target="_blank" rel="noopener noreferrer"><span class="li-main"><span class="li-title wrap">' + esc(c.country) + (c.against ? ' · against travel' : '') + '</span>' +
+          '<span class="li-sub">' + esc(c.text) + '</span></span>' + ICON.chev + '</a>';
+      }).join('') + '</div>' : '<p class="small muted">No travel advice changes in the last three days.</p>';
+      h += '<p class="small muted">The Foreign Office\'s travel advice changes. One advising against travel is often the first sign something is going on there.</p>';
+    } else if (key === 'drought') {
+      h += r.storage != null ? '<p>England\'s reservoirs are <b>' + esc(fq(r.storage)) + '% full</b>' + (r.vs_average ? ', ' + esc(fq(Math.abs(r.vs_average))) + '% ' + (r.vs_average < 0 ? 'below' : 'above') + ' average for the time of year' : '') + ' (week to ' + esc(r.week) + ').</p>' : '';
+      h += r.area ? '<p>' + esc(r.area) + ': <b>' + esc((r.stage || 'Normal').toLowerCase()) + '</b>.</p>' : '<p class="small muted">Choose your Environment Agency area in the warnings settings to see your own drought status.</p>';
+      h += r.ban ? '<p><b>Hosepipe ban:</b> ' + esc(r.ban) + '</p>' : '';
+      h += r.company_text ? '<p class="small">' + esc(r.company) + ': ' + esc(r.company_text) + '</p>' : '';
+      h += '<p class="small muted">From the Environment Agency\'s weekly dry weather and drought report. ' + (r.url ? '<a href="' + esc(r.url) + '" target="_blank" rel="noopener noreferrer">Read it</a>.' : '') + '</p>';
+    } else if (key === 'water') {
+      h += (r.reports || []).length ? '<div class="list">' + r.reports.map(function (x) {
+        return '<div class="li"><span class="li-ico">🚰</span><span class="li-main"><span class="li-title wrap">' + esc(x.kind) + '</span><span class="li-sub">' + esc(fq(x.km)) + ' km away · ' + esc(x.group) + (x.issued ? ' · ' + esc(whenText(x.issued)) : '') + '</span></span></div>';
+      }).join('') + '</div>' : '<p class="small muted">Nothing reported within 10 km.</p>';
+      h += '<p class="small muted">From ' + esc(r.company) + '\'s <a href="' + esc(r.url) + '" target="_blank" rel="noopener noreferrer">in my area</a> map. A supply problem within 3 km is probably yours.</p>';
+    } else if (key === 'floodrisk') {
+      h += '<p>Flood risk for the next five days: <b>' + esc(String(r.risk || '').toLowerCase()) + '</b>' + (r.rising ? ', rising' : '') + '.</p>' + (r.text ? '<p class="small">' + esc(r.text) + '</p>' : '') +
+        '<p class="small muted">The Flood Forecasting Centre\'s daily Flood Guidance Statement for England and Wales. ' + (r.url ? '<a href="' + esc(r.url) + '" target="_blank" rel="noopener noreferrer">The full statement</a>.' : '') + '</p>';
+    } else if (key === 'rain') {
+      h += r.day_mm != null ? '<p><b>' + esc(fq(r.day_mm)) + ' mm</b> in the last 24 hours, ' + esc(fq(Math.round(r.week_mm))) + ' mm in 7 days.</p>' +
+        '<p class="small muted">Averaged over the nearest ' + (r.gauges || []).map(function (g) { return esc(g.name) + ' (' + esc(fq(g.km)) + ' km)'; }).join(', ') + '. Over 30 mm in a day is heavy: watch for surface water.</p>'
+        : '<p class="small muted">No Environment Agency rain gauge within 25 km of home.</p>';
+    } else if (key === 'ground') {
+      h += (r.boreholes || []).length ? '<table class="live-table"><thead><tr><th>Borehole</th><th>For the time of year</th></tr></thead><tbody>' + r.boreholes.map(function (b) {
+        return '<tr><td><a href="' + esc(b.url) + '" target="_blank" rel="noopener noreferrer">' + esc(b.name) + '</a><br><span class="small muted">' + esc(fq(b.km)) + ' km · ' + esc(fmtDate(b.date)) + '</span></td><td>' + esc(b.band) + '</td></tr>';
+      }).join('') + '</tbody></table>' : '<p class="small muted">No borehole within 30 km with recent readings.</p>';
+      h += '<p class="small muted">Groundwater feeds many springs, wells and rivers. Most boreholes are read by hand every few months, so each reading is compared with the same time of year since records began.</p>';
+    } else if (key === 'gridnow') {
+      h += '<p>Carbon intensity: <b>' + esc(String(r.ci)) + ' g CO2 per kWh</b> (' + esc(r.index || '') + ').' + (r.hz ? ' Frequency ' + esc(r.hz.toFixed(2)) + ' Hz (' + esc(r.hz_min.toFixed(2)) + '–' + esc(r.hz_max.toFixed(2)) + ' in 15 minutes).' : '') + '</p>' +
+        ((r.mix || []).length ? '<div class="chips">' + r.mix.map(function (m) { return '<span class="chip static">' + esc(m.fuel) + ' ' + esc(fq(m.pct)) + '%</span>'; }).join('') + '</div>' : '') +
+        '<p class="small muted">Britain\'s grid runs at 50 Hz. A dip below 49.8 usually means a large power station or link has tripped.</p>';
+    } else if (key === 'gridstress') {
+      h += '<p>Tightest in the next 14 hours: <b>' + esc(fq(Math.round(r.margin_mw / 100) / 10)) + ' GW spare</b>.' + (r.low_mw != null ? ' Lowest in the next two weeks: ' + esc(fq(Math.round(r.low_mw / 100) / 10)) + ' GW on ' + esc(fmtDate(r.low_on)) + '.' : '') + '</p>' +
+        ((r.dfs || []).length ? '<p>Demand Flexibility Service: ' + r.dfs.map(function (e) { return esc(fmtDate(e.day) + ' ' + e.from + '–' + e.to); }).join(', ') + '. If your supplier takes part, you may be paid to use less then.</p>' : '') +
+        '<p class="small muted">The de-rated margin is the spare generating capacity once likely breakdowns are allowed for. Above about 3 GW is comfortable.</p>';
     } else if (key === 'pound') {
       h += '<table class="live-table"><tbody>' +
         (r.usd ? '<tr><td>£1 in dollars</td><td class="num">$' + esc(r.usd.toFixed(2)) + '</td><td class="num">' + (r.usd_week != null ? esc((r.usd_week > 0 ? '+' : '') + fq(r.usd_week)) + '% in a week' : '') + '</td></tr>' : '') +
@@ -1687,9 +1820,20 @@
       '<h3>Sources</h3>' + w.source_list.map(function (s) {
         return (s[0] === LIVE_KEYS[0] ? '<h3>Live information</h3><p class="small muted">The wider picture: rivers and power cuts near home, the electricity grid, ' +
           'gas storage, air quality, space weather and the pound. Each is a public feed for the whole country, so nothing is sent about where you are.</p>' : '') +
-          '<label class="opt"><input type="checkbox" name="src_' + s[0] + '"' + (c.sources[s[0]] ? ' checked' : '') + '><span>' + esc(s[1]) + '</span></label>';
+          (s[0] === LIVE_MORE ? '<h3>More of the wider picture</h3><p class="small muted">The threat level, cyber security, travel advice, drought, the five-day flood risk, ' +
+            'rain and groundwater near home, and the electricity grid. The daily briefing reads these too. Public feeds again: nothing is sent about where you are.</p>' : '') +
+          (w.unavailable && w.unavailable[s[0]]
+            ? '<label class="opt is-off"><input type="checkbox" name="src_' + s[0] + '" disabled' + (c.sources[s[0]] ? ' checked' : '') + '><span>' + esc(s[1]) +
+              '<span class="small muted">Not available for your area: ' + esc(w.unavailable[s[0]].charAt(0).toLowerCase() + w.unavailable[s[0]].slice(1)) + '</span></span></label>'
+            : '<label class="opt"><input type="checkbox" name="src_' + s[0] + '"' + (c.sources[s[0]] ? ' checked' : '') + '><span>' + esc(s[1]) + '</span></label>');
       }).join('') +
       '<h3>Where you are</h3>' +
+      '<div class="grid2"><label class="field"><span>Environment Agency area</span><select name="ea_area"><option value="">Not set (England\'s totals)</option>' +
+      (w.ea_areas || []).map(function (a) { return '<option' + (c.ea_area === a ? ' selected' : '') + '>' + esc(a) + '</option>'; }).join('') + '</select>' +
+      '<div class="hint">For your drought status. England only.</div></label>' +
+      '<label class="field"><span>Water company</span><select name="water_co"><option value="">Not set</option>' +
+      (w.water_cos || []).map(function (a) { return '<option' + (c.water_co === a ? ' selected' : '') + '>' + esc(a) + '</option>'; }).join('') + '</select>' +
+      '<div class="hint">For hosepipe bans, and supply problems (Cambridge Water and South Staffs Water only).</div></label></div>' +
       '<label class="field"><span>Met Office region</span><select name="region">' +
       '<option value="">' + (guess ? 'From my location: ' + esc(guess) : 'From my location') + '</option>' +
       '<option value="UK"' + (c.region === 'UK' ? ' selected' : '') + '>The whole UK</option>' +
@@ -1722,14 +1866,14 @@
   var SRC_CLASS = { 'UK Government': 'gov', 'SAS Survival Handbook': 'sas', 'Fire & rescue services': 'fire',
     'Dads Army tip': 'tip', 'Electricity networks': 'net' };
   var LEVEL_RULES = {
-    5: ['An Emergency Alert', 'A severe flood warning', 'A gas, carbon monoxide or smoke alarm going off'],
+    5: ['An Emergency Alert for your area', 'A severe flood warning', 'A gas, carbon monoxide or smoke alarm going off'],
     4: ['A red weather warning', 'A flood warning', 'A power cut over 12 hours, or with the backup battery under 20%',
       'The coldest room under 9°C, or the warmest 33°C or more', 'PM2.5 air pollution of 75 µg/m³ or more'],
     3: ['An amber weather warning', 'A possible fire within 3 km', 'A power cut', 'A water leak',
       'A river near you higher than it\'s been for years',
       'The coldest room under 12°C, or the warmest 30°C or more', '−10°C or colder, or 35°C or hotter, outside',
       'PM2.5 of 55 µg/m³ or more'],
-    2: ['A yellow weather warning', 'A flood alert', 'A disaster near the UK', 'A possible fire nearby',
+    2: ['A yellow weather warning', 'A flood alert', 'A disaster in or near the UK (not one abroad that can\'t reach you, such as an earthquake in Norway; volcanic ash can)', 'A possible fire nearby',
       'A power cut within 2 km', 'A river near you above its normal range', 'High air pollution', 'A severe solar storm',
       'A warning of planned rota power cuts',
       'The coldest room under 16°C, or the warmest 27°C or more', '−5°C or colder, or 30°C or hotter, outside',
@@ -2245,7 +2389,7 @@
       'Anything you already have is skipped. To clear out what you don\'t need, use <b>Select to delete</b> in Stores.</p>' +
       '<button class="btn block" data-act="seed">Load starter list</button></section>';
 
-    html += scanHqCard();
+    html += scanHqCard() + briefHqCard();
     html += warnHqCard() + homeCard() + haCard();
 
     html += '<section class="card"><div class="card-head"><h2>Appearance</h2></div><div class="seg" role="group" aria-label="Theme">' +
@@ -3191,6 +3335,7 @@
         st.tasks.labels ? st.tasks.labels + ' label' + (st.tasks.labels === 1 ? '' : 's') : '',
         st.tasks.filled ? st.tasks.filled + ' fill-in' + (st.tasks.filled === 1 ? '' : 's') : '',
         st.tasks.review ? st.tasks.review + ' stores review' + (st.tasks.review === 1 ? '' : 's') : '',
+        st.tasks.briefing ? st.tasks.briefing + ' briefing' + (st.tasks.briefing === 1 ? '' : 's') : '',
         st.tasks.other ? st.tasks.other + ' other (names translated)' : '',
         st.failed ? st.failed + ' failed' : '',
         st.avg_usd != null ? 'about ' + usd(st.avg_usd) + ' each' : '',
@@ -3609,6 +3754,10 @@
         var wi = W().items[+a.dataset.i];
         return wi ? openSheet({ type: 'warning', w: wi }) : null;
       }
+      case 'brief-now':
+        a.disabled = true;
+        return api('POST', 'api/briefing/now', {}).then(function (r) { S.briefing = r; redrawBrief(); toast('Writing a briefing: it takes a minute or two'); setTimeout(refresh, 8000); },
+          function (err) { a.disabled = false; toast(err.message, { error: true }); });
       case 'warn-set':
         return openSheet({ type: 'warnset' });
       case 'trend-metric':
@@ -4026,7 +4175,8 @@
     }
     if (f.id === 'warnForm') {
       var wbody = { on: f.elements.on.checked, region: d.region || '', lat: d.lat, lon: d.lon,
-        flood_km: num(d.flood_km), gdacs_km: num(d.gdacs_km), fire_km: num(d.fire_km), sources: {} };
+        flood_km: num(d.flood_km), gdacs_km: num(d.gdacs_km), fire_km: num(d.fire_km), sources: {},
+        ea_area: d.ea_area || '', water_co: d.water_co || '' };
       W().source_list.forEach(function (s) { wbody.sources[s[0]] = f.elements['src_' + s[0]].checked; });
       if ((d.lat === '') !== (d.lon === '')) { toast('Give both a latitude and a longitude, or leave both empty', { error: true }); return; }
       return run(function () {

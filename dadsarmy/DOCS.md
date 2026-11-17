@@ -248,7 +248,7 @@ The names are the UK's own five national threat levels, the nearest British equi
 | 🟨 | **MODERATE** | Something to keep an eye on: a yellow warning, a minor problem at home, or stores that wouldn't last 3 days. Stay aware. |
 | 🟧 | **SUBSTANTIAL** | Disruption is likely: an amber warning, a power cut, a leak, or a cold or hot home. Get ready. |
 | 🟥 | **SEVERE** | Disruption is highly likely or under way: a red warning, a flood warning, a long power cut, or a dangerously cold or hot home. Act now. |
-| ⬛ | **CRITICAL** | Danger to life, now or very soon: an Emergency Alert, a severe flood warning, or a gas, carbon monoxide or smoke alarm. Follow the emergency services' instructions. |
+| ⬛ | **CRITICAL** | Danger to life, now or very soon: an Emergency Alert for your area, a severe flood warning, or a gas, carbon monoxide or smoke alarm. Follow the emergency services' instructions. |
 
 It's worked out from three things:
 
@@ -358,8 +358,8 @@ Dads Army can show official warnings for where you live: on the Sitrep, on the *
 |---|---|
 | Met Office | Yellow, amber and red weather warnings for your region |
 | Environment Agency | Flood alerts, flood warnings and severe flood warnings near you (England only) |
-| GOV.UK Emergency Alerts | Alerts about a danger to life, while they're being sent and for 12 hours after |
-| GDACS (the UN and EU disaster alert system) | Orange and red alerts for earthquakes, floods, storms, volcanoes and tsunamis within 1,000 km |
+| GOV.UK Emergency Alerts | Alerts about a danger to life, while they're being sent and for 12 hours after. Only one whose area takes in home (your county, district, ward, region or constituency, or the whole UK or your nation) raises your alert level; to know that, home's location rounded to about 1 km is looked up once at postcodes.io. Until it's known, every alert counts |
+| GDACS (the UN and EU disaster alert system) | Orange and red alerts for earthquakes, floods, storms, volcanoes and tsunamis within 1,000 km. Only one in the UK or Ireland, within 300 km, or a volcano within 2,000 km (ash closes airports) raises your alert level: an earthquake in Norway shows here but doesn't |
 | NASA FIRMS (optional) | Possible fires within 10 km: hotspots seen by satellite in the last 24 hours |
 | UK Health Security Agency (optional) | Its latest news, such as cold-weather and heat-health alerts |
 | WHO (optional) | Disease outbreak news |
@@ -401,6 +401,40 @@ Switched on with the warnings, and listed under **Live information** in the warn
 - Not covered yet: river levels in Scotland and Wales (SEPA and Natural Resources Wales), and power cuts from SP Energy Networks and Electricity North West, which need an account. There's no official free source for the FTSE 100, so it isn't included.
 
 Sources: Environment Agency flood and river level data from the real-time data API (Beta), and Defra's UK-AIR, under the Open Government Licence; power cut data from UK Power Networks, National Grid Electricity Distribution, SSEN and Northern Powergrid under their open data licences; system warnings from Elexon's BMRS; National Gas's data portal; NOAA's Space Weather Prediction Center; and the Bank of England's database, under the Open Government Licence.
+
+### More of the wider picture (1.15.0)
+
+Under **More of the wider picture** in the warnings settings. All public; the rain gauges and boreholes are the whole national list, and Dads Army picks the nearest itself.
+
+| Feed | What you get | Warns when |
+|---|---|---|
+| UK threat level (MI5) | The national level, and Northern Ireland's | It goes up (for a week), or it's critical |
+| Cyber security (NCSC) | The NCSC's news from the last two weeks | A critical flaw or live attack in the last three days |
+| Travel advice (FCDO) | Countries whose advice changed in the last three days | Shown, but not a warning |
+| Drought, reservoirs and hosepipe bans (Environment Agency, England) | Reservoir storage, your area's drought status, your water company's hosepipe ban | Your area is in drought, or your water company has a hosepipe ban |
+| Water supply problems (Cambridge Water and South Staffs Water) | Supply reports within 10 km | A supply problem within 3 km |
+| Five-day flood risk (Flood Forecasting Centre, England and Wales) | The overall risk and whether it's rising | Medium or high |
+| Rainfall near you (Environment Agency) | Rain in 24 hours and 7 days at the nearest gauges (within 25 km) | 30 mm or more in a day |
+| Groundwater near you (Environment Agency) | The nearest boreholes (within 30 km) against the time of year | Shown, but not a warning |
+| The grid now (NESO, Elexon) | Carbon intensity, the generation mix and the frequency | The frequency dips below 49.8 Hz |
+| Electricity margin (Elexon, NESO) | The tightest spare margin in the next 14 hours and two weeks, and Demand Flexibility Service events | The margin is under 3 GW |
+
+- Choose your **Environment Agency area** and **water company** in the warnings settings for drought status and hosepipe bans.
+- **Water supply** only covers Cambridge Water and South Staffs Water customers, the only companies that publish their incidents this way. Anywhere else (worked out from your water company, or from where home is if you haven't chosen one) it isn't fetched or shown, and its switch says why. Equivalents for other water companies, and SEPA and Natural Resources Wales data for Scotland and Wales, would be good to add.
+- Not included: stock markets and commodity prices, as there's no free official source.
+
+Sources: MI5; the National Cyber Security Centre; the FCDO's travel advice and the Environment Agency's drought reports on GOV.UK; the Flood Forecasting Centre's Flood Guidance Statement; Environment Agency rainfall (real-time data API) and groundwater (Hydrology API) data, all under the Open Government Licence; NESO's Carbon Intensity API (CC BY 4.0) and Data Portal; Elexon's BMRS; and Cambridge Water's and South Staffs Water's public incident maps.
+
+## The daily briefing
+
+Every morning at 6am, Claude reads what Dads Army already knows and searches the news, then writes one paragraph on the threats and risks to be aware of: locally, across the UK and in the world, against what's been usual over the last fortnight. It's at the top of the Sitrep.
+
+- **Switch it on** in HQ, in the **Daily briefing** card under Scanning. It needs an Anthropic API key (choose **Anthropic Claude** under Scanning and paste it), because the news search runs on Anthropic's side. Without one, the card says so.
+- **How thorough:** Standard (Claude Haiku 5.5, about 7p a day) or Thorough (Claude Sonnet 5.5, about 25p a day). Each search costs a cent on top of the tokens. It counts towards the monthly AI limit, and shows in the spending stats.
+- **What's sent to Anthropic:** the area name (what you type under **Local news for**, or your Met Office region), the day's warnings and wider picture, health news, and how many days your food and water would last. Nothing else about you, and not your location.
+- **On the Sitrep:** the paragraph, Local, UK and World ratings from quiet to severe ("↑ above usual" when something's up), the sources it relied on (only ones that really came back from its searches) and what it searched for. Written by AI: check anything important with the official source.
+- If it fails it tries again 20 minutes later, up to four times a day. If Anthropic refuses the key, it switches itself off. **Write one now** writes one straight away.
+- In Home Assistant: `sensor.dads_army_briefing`, with the headline as its state and the paragraph, ratings and sources as attributes.
 
 ## Trends
 

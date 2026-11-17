@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.15.0
+
+**The daily briefing**
+
+- **Every morning at 6am**, Claude reads what Dads Army already knows (the warnings, the wider picture, health news and how long your stores last), searches the news, and writes **one paragraph** on the threats and risks to be aware of: locally, across the UK and in the world (weather, conflict, cyber, health, power, supply and more), compared with what's been usual over the last fortnight. It's at the top of the Sitrep, with Local, UK and World ratings ("↑ above usual" when something's up), the sources it relied on and what it searched for.
+- **Off until you switch it on**, in HQ under Scanning. It needs your own Anthropic API key, as the news search runs on Anthropic's side; without one, the card explains that and the switch isn't shown. **Standard** (Claude Haiku 5.5) is about 7p a day, **Thorough** (Claude Sonnet 5.5) about 25p. It counts towards the monthly AI limit and the spending stats, and a key Anthropic refuses switches it off rather than trying every day.
+- **Local news for** a town or county you type, or your Met Office region. That name, the day's warnings and wider picture and how long your stores last are sent to Anthropic; nothing else about you.
+- **Write one now** in HQ, a history of 60 days for the baseline, and `sensor.dads_army_briefing` in Home Assistant (the headline, with the paragraph, ratings and sources as attributes). `GET/PUT /api/briefing`, `POST /api/briefing/now`.
+
+**More of the wider picture**
+
+Ten more live sources, under **More of the wider picture** in the warnings settings. The briefing reads them too.
+
+- **UK threat level** (MI5): a warning for a week after it goes up, and at critical.
+- **Cyber security** (NCSC): a warning for a critical flaw or live attack in the last three days.
+- **Travel advice** (FCDO): which countries' advice changed in the last three days, and any against travel.
+- **Drought, reservoirs and hosepipe bans** (the Environment Agency's weekly report, England): reservoir storage, your area's drought status and your water company's hosepipe ban. Choose your Environment Agency area and water company in the warnings settings.
+- **Water supply problems near you**: supply reports within 10 km from Cambridge Water's and South Staffs Water's public maps. Only those two companies publish this, so it **switches itself off** anywhere else, and the settings say "Not available for your area: only covers Cambridge Water and South Staffs Water customers" (or "Needs your home location").
+- **Five-day flood risk** (the Flood Forecasting Centre, England and Wales): a warning at medium or high.
+- **Rainfall near you** (Environment Agency rain gauges within 25 km): a warning at 30 mm in a day, serious at 50.
+- **Groundwater near you** (Environment Agency boreholes within 30 km), against the same time of year. Off to begin with.
+- **The grid now**: carbon intensity and the mix (NESO), and the frequency (Elexon), with a warning if it dips. Off to begin with.
+- **Electricity margin** (Elexon) for the next 14 hours and two weeks, and NESO's Demand Flexibility Service events: a warning when the margin is tight.
+
+**Only what can reach you raises the alert level**
+
+- An **Emergency Alert** raises it only if its area takes in home: your county, district, ward, region or constituency, or the whole UK or your nation. One for another county still shows in the live panel. To know home's area, its location rounded to about 1 km is looked up once at postcodes.io (ONS data); until then every alert counts, to be safe.
+- A **GDACS disaster** raises it only if it's in the UK or Ireland, within 300 km, or a volcano within 2,000 km (ash closes airports). An earthquake in Norway shows in the panel but no longer raises the level.
+
 ## 1.14.0
 
 **Stores review**
