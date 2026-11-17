@@ -248,9 +248,9 @@ class LiveRunTest(AppTest):
     def test_all_seven_come_through(self):
         server.warnings_run()
         w = server.warn_public()
-        # Water supply only covers Cambridge Water and South Staffs Water customers, so not Whitby.
+        # Water supply needs your water company choosing (it isn't guessed), so not yet.
         self.assertEqual([r["key"] for r in w["live_rows"]], [k for k in server.LIVE_KEYS if k != "water"])
-        self.assertEqual(w["unavailable"], {"water": server.WATER_ONLY})
+        self.assertEqual(w["unavailable"], {"water": server.WATER_CHOOSE})
         bad = dict((k, v) for k, v in w["sources"].items() if not v["ok"])
         self.assertEqual(bad, {})
         rows = dict((r["key"], r) for r in w["live_rows"])
@@ -303,6 +303,6 @@ class LiveRunTest(AppTest):
         server.warnings_run()
         ents = server.ha_entities(server.summary())
         live = ents["sensor.dads_army_live"]
-        self.assertEqual(len(live["attributes"]["rows"]), len(server.LIVE_KEYS) - 1)   # all but water (not Whitby)
+        self.assertEqual(len(live["attributes"]["rows"]), len(server.LIVE_KEYS) - 1)   # all but water (not chosen)
         self.assertGreaterEqual(int(live["state"]), 4)
         self.assertIn("sensor.dads_army_live", json.dumps(server.dashboard_config()))

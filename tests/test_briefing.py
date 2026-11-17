@@ -167,8 +167,9 @@ class SourcesTest(AppTest):
     """The parsers, with small stand-in feeds."""
 
     def test_threat_level(self):
-        level, ni, since = server.parse_threat(feeds.threat())
+        level, ni = server.parse_threat(feeds.threat())   # GOV.UK's guide (MI5's feed is behind a bot check)
         self.assertEqual((level, ni), ("SUBSTANTIAL", "SUBSTANTIAL"))
+        since = None
         items, r = server.threat_live(level, ni, since, {}, NOW)
         self.assertEqual(items, [])
         items, r2 = server.threat_live("SEVERE", ni, since, r, NOW)   # raised
@@ -178,6 +179,24 @@ class SourcesTest(AppTest):
         self.assertEqual(items, [])
         items, _ = server.threat_live("CRITICAL", ni, since, r2, NOW)
         self.assertEqual(items[0]["severity"], 3)
+        self.assertEqual(items[0]["url"], "https://www.gov.uk/terrorism-national-emergency/terrorism-threat-levels")
+        with self.assertRaises(ValueError):
+            server.parse_threat(b'{"details": {"parts": [{"slug": "terrorism-threat-levels", "body": "<p>Moved.</p>"}]}}')
+
+    def test_threat_level_since(self):
+        """GOV.UK doesn't date the level: it's dated when Dads Army sees it change."""
+        server.FEED_URLS["threat"] = "stand-in"
+        server.http_get = lambda url, **kw: feeds.threat()
+        mem = {"live": {}}
+        items, r = server.fetch_live("threat", server.warn_cfg(), None, mem, NOW)
+        self.assertEqual((r["level"], r["since"]), ("SUBSTANTIAL", ""))   # first look: not known
+        mem["live"]["threat"] = dict(r, level="MODERATE")
+        items, r = server.fetch_live("threat", server.warn_cfg(), None, mem, NOW)
+        self.assertEqual(r["since"], server.iso_utc(NOW))                  # it went up today
+        self.assertIn("raised to SUBSTANTIAL", items[0]["title"])
+        mem["live"]["threat"] = r
+        later = NOW + dt.timedelta(days=1)
+        self.assertEqual(server.fetch_live("threat", server.warn_cfg(), None, mem, later)[1]["since"], server.iso_utc(NOW))
 
     def test_ncsc(self):
         news = server.parse_ncsc(feeds.ncsc(), NOW)
@@ -214,11 +233,13 @@ class SourcesTest(AppTest):
         self.assertEqual(items[0]["severity"], 1)
 
     def test_rain(self):
-        rows = json.loads(feeds.rain())["items"]
+        rows = [(r["dateTime"], r["value"]) for r in json.loads(feeds.rain())["items"]]
         day, week = server.rain_totals(rows, NOW)
         self.assertEqual((day, week), (33.0, 38.0))
-        items, r = server.rain_live([(2.0, "Near gauge", day, week)], NOW)
+        items, r = server.rain_live([(2.0, "Near gauge", day, week, "Environment Agency", "R1")], NOW)
         self.assertEqual((r["day_mm"], items[0]["severity"]), (33.0, 1))
+        # The nearest gauge's own page (check-for-flooding's /rainfall page is gone)
+        self.assertEqual(items[0]["url"], "https://check-for-flooding.service.gov.uk/rainfall-station/R1")
 
     def test_groundwater(self):
         got = server.gw_status(json.loads(feeds.gw())["items"], NOW.date())
@@ -241,23 +262,29 @@ class SourcesTest(AppTest):
     def test_water_supply(self):
         data = json.loads(feeds.water())
         data["features"][0]["attributes"]["Region__c"] = "S"
-        data["features"][0]["geometry"] = {"x": -1.62, "y": 52.81}   # a kilometre or two from BURTON
-        items, r = server.water_live(data, "South Staffs Water", BURTON, NOW)
-        self.assertEqual(items[0]["severity"], 2)    # no water, under 3 km away
+        data["features"][0]["geometry"] = {"x": -1.637, "y": 52.805}   # 600 m from BURTON
+        reports = server.aptumo_reports(json.dumps(data).encode(), "S")
+        items, r = server.water_live(reports, "South Staffs Water", BURTON, NOW)
+        self.assertEqual(items[0]["severity"], 2)    # no water, under 1 km away
         self.assertEqual(r["supply"], 1)
+        self.assertEqual(server.aptumo_reports(feeds.water(), "S"), [])   # Cambridge Water's report isn't South Staffs'
+        with self.assertRaises(ValueError):
+            server.aptumo_reports(b'{"error": {"message": "Token required"}}', "S")
 
 
 class CoverageTest(AppTest):
-    """Water supply only covers Cambridge Water and South Staffs Water customers. Everything else is for everyone."""
+    """Water supply only covers six water companies' customers, once you've said which is yours. (The nations' and
+    networks' coverage is in test_regional.)"""
 
     def test_water_companies(self):
         cov = server.water_coverage
         self.assertEqual(cov({}, None), (False, "Needs your home location"))
-        self.assertEqual(cov({}, BURTON), (True, ""))
-        self.assertEqual(cov({}, DEVON), (False, server.WATER_ONLY))
-        self.assertEqual(cov({}, LONDON), (False, server.WATER_ONLY))
-        self.assertEqual(cov({"water_co": "South West Water"}, BURTON), (False, server.WATER_ONLY))   # you said
-        self.assertEqual(cov({"water_co": "Cambridge Water"}, DEVON), (True, ""))
+        self.assertEqual(cov({}, BURTON), (False, server.WATER_CHOOSE))   # not guessed: choose it in the settings
+        self.assertEqual(cov({}, LONDON), (False, server.WATER_CHOOSE))
+        self.assertEqual(cov({"water_co": "South Staffs Water"}, BURTON), (True, ""))
+        self.assertEqual(cov({"water_co": "South West Water"}, DEVON), (True, ""))
+        self.assertEqual(cov({"water_co": "Thames Water"}, LONDON), (False, server.WATER_ONLY))   # no feed of its own
+        self.assertIn("Yorkshire Water", server.WATER_ONLY)
 
     def test_everything_else_covers_everyone(self):
         for k in server.LIVE_KEYS:
@@ -272,7 +299,9 @@ class CoverageTest(AppTest):
         server.warnings_run()
         w = server.warn_public()
         self.assertNotIn("water", w["live"])
-        self.assertEqual(w["unavailable"], {"water": server.WATER_ONLY})
+        self.assertEqual(w["unavailable"], {"water": server.WATER_CHOOSE})
         self.assertNotIn("water", w["sources"])
+        server.api_warnings_set({"water_co": "Thames Water"}, {})
+        self.assertEqual(server.warn_public()["unavailable"], {"water": server.WATER_ONLY})
         server.api_warnings_set({"lat": "", "lon": ""}, {})
         self.assertEqual(server.warn_public()["unavailable"], {"water": "Needs your home location"})

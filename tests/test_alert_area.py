@@ -14,8 +14,8 @@ HOME = {"lat": 51.5007, "lon": -0.1246}   # Westminster
 
 class TestAlertArea(unittest.TestCase):
     def setUp(self):
-        server.HOME_PLACES.update(key=(51.5, -0.12), names=["westminster", "cities of london and westminster", "london"],
-                                  nation="england", busy=False, at=1e12)
+        server.HOME_PLACES.update(key=server._places_key(HOME), names=["westminster", "cities of london and westminster",
+                                                                       "london"], nation="england", busy=False, at=1e12)
 
     def tearDown(self):
         server.HOME_PLACES.update(key=None, names=[], nation="", busy=False, at=0.0)
