@@ -228,9 +228,17 @@ class SourcesTest(AppTest):
                          dt.date(2026, 11, 5))
 
     def test_flood_risk(self):
-        items, r = server.floodrisk_live(server.parse_floodrisk(feeds.floodrisk()))
-        self.assertEqual((r["risk"], r["rising"]), ("MEDIUM", True))
-        self.assertEqual(items[0]["severity"], 1)
+        whitby = {"lat": 54.486, "lon": -0.615}
+        items, r = server.floodrisk_live(feeds.floodrisk(), feeds.floodrisk_areas(), whitby)
+        self.assertEqual((r["risk"], r["rising"], r["days"]), ("MEDIUM", True, 5))   # low today, medium from tomorrow
+        tomorrow = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)).strftime("%A")
+        self.assertEqual((items[0]["severity"], items[0]["title"]), (1, "Flood risk medium where you live on " + tomorrow))
+        self.assertEqual(r["text"], "River flooding is possible in the north east & Yorkshire.")
+        items, r = server.floodrisk_live(feeds.floodrisk(), feeds.floodrisk_areas(), LONDON)   # in no area at risk
+        self.assertEqual((items, r["risk"]), ([], "VERY LOW"))
+        for bad in (b"null", b"[]", b'{"features": 3}'):
+            with self.assertRaises(ValueError):
+                server.floodrisk_live(feeds.floodrisk(), bad, LONDON)
 
     def test_rain(self):
         rows = [(r["dateTime"], r["value"]) for r in json.loads(feeds.rain())["items"]]

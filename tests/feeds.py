@@ -153,7 +153,7 @@ class FakeFeeds(object):
 
 
 # -- More of the wider picture (1.15.0): stand-ins for the threat level, NCSC, FCDO, the drought report, the
-# flood guidance statement, rain gauges, boreholes, carbon intensity, frequency, margins and water incidents.
+# flood risk outlook, rain gauges, boreholes, carbon intensity, frequency, margins and water incidents.
 def threat():
     """GOV.UK's "Terrorism and national emergencies" guide, as its Content API gives it (17 Nov 2026's shape)."""
     return json.dumps({"title": "Terrorism and national emergencies", "details": {"parts": [
@@ -209,10 +209,26 @@ def govuk():
 
 
 def floodrisk():
-    return json.dumps({"statements": [{"headline": "The flood risk is MEDIUM on Saturday in the north east.",
-                                       "issued_at": ago(hours=3).isoformat(), "flood_risk_trend": {"day1": "increasing"},
-                                       "public_forecast": {"england_forecast": "River flooding is possible in the north east."},
-                                       "pdf_url": "https://flood-warning-information.service.gov.uk/fgs.pdf"}]}).encode()
+    """Check for flooding's front page, as it was on 17 November 2026 (just the parts read)."""
+    days = [{"idx": n, "level": 0, "date": (NOW + dt.timedelta(days=n - 1)).strftime("%Y-%m-%dT10:30:00.000Z")} for n in range(1, 6)]
+    return ("<html><body><h2>Flood forecast for the next 5 days</h2><p>River flooding is possible in the north east "
+            "&amp; Yorkshire.</p><p>Updated at 10:30am</p><script>window.flood.model = {\n  \"outlookUTC\": \"%s\"}\n"
+            "window.flood.model.outlookDays = %s</script></body></html>"
+            % (ago(hours=3).strftime("%Y-%m-%dT%H:%M:%SZ"), json.dumps(days))).encode()
+
+
+def _around(lat, lon, d):
+    return {"type": "Polygon", "coordinates": [[[lon - d, lat - d], [lon + d, lat - d], [lon + d, lat + d],
+                                                [lon - d, lat + d], [lon - d, lat - d]]]}
+
+
+def floodrisk_areas():
+    """The areas at risk: medium round Whitby from tomorrow, low across more of Yorkshire, high in Cumbria."""
+    return json.dumps({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"risk-level": 2, "days": [1, 2, 3], "z-index": 1}, "geometry": _around(54.4, -0.8, 0.5)},
+        {"type": "Feature", "properties": {"risk-level": 3, "days": [2, 3], "z-index": 2}, "geometry": _around(54.486, -0.615, 0.1)},
+        {"type": "Feature", "properties": {"risk-level": 4, "days": [2], "z-index": 3}, "geometry": _around(54.6, -3.1, 0.2)},
+        {"type": "Feature", "properties": {"risk-level": "x"}}, None]}).encode()
 
 
 def rainst():
@@ -282,7 +298,7 @@ def water():
 def wider_routes():
     return {"threat": (threat, "application/xml"), "ncsc": (ncsc, "application/xml"), "fcdo": (fcdo, "application/xml"),
             "dsearch": (dsearch, "application/json"), "govuk": (govuk, "application/json"),
-            "floodrisk": (floodrisk, "application/json"), "rainst": (rainst, "application/json"),
+            "floodrisk": (floodrisk, "text/html"), "floodareas": (floodrisk_areas, "application/json"), "rainst": (rainst, "application/json"),
             "rain": (rain, "application/json"), "gwst": (gwst, "application/json"), "gw": (gw, "application/json"),
             "ci": (ci, "application/json"), "cimix": (cimix, "application/json"), "freq": (freq, "application/json"),
             "margin": (margin, "application/json"), "margind": (margind, "application/json"),
@@ -292,7 +308,7 @@ def wider_routes():
 
 def wider_urls(b):
     return {"threat": b + "threat", "cyber": b + "ncsc", "travel": b + "fcdo", "drought_search": b + "dsearch",
-            "govuk_content": b + "govuk", "floodrisk": b + "floodrisk", "rain_stations": b + "rainst",
+            "govuk_content": b + "govuk", "floodrisk": b + "floodrisk", "floodrisk_areas": b + "floodareas", "rain_stations": b + "rainst",
             "rain": b + "rain/{id}?since={since}", "gw_stations": b + "gwst", "gw": b + "gw/{id}?{query}",
             "ci_now": b + "ci", "ci_mix": b + "cimix", "frequency": b + "freq?from={start}&to={end}",
             "margin": b + "margin?from={start}&to={end}", "margin_daily": b + "margind", "dfs": b + "dfs?",

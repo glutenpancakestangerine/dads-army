@@ -5706,7 +5706,8 @@ FEED_URLS = {
     "drought_search": "https://www.gov.uk/api/search.json?q=%22dry+weather+and+drought+in+England%22&count=20"
                       "&fields=title,link,public_timestamp",
     "govuk_content": "https://www.gov.uk/api/content",
-    "floodrisk": "https://api.ffc-environment-agency.fgs.metoffice.gov.uk/api/public/statements",
+    "floodrisk": "https://check-for-flooding.service.gov.uk/",
+    "floodrisk_areas": "https://check-for-flooding.service.gov.uk/api/outlook.geojson",
     "rain_stations": "https://environment.data.gov.uk/flood-monitoring/id/stations?parameter=rainfall&_limit=10000",
     "rain": "https://environment.data.gov.uk/flood-monitoring/id/stations/{id}/readings?parameter=rainfall&since={since}"
             "&_limit=2000",
@@ -5782,7 +5783,7 @@ WARN_SOURCES = [  # key, what it is, on by default
     ("travel", "Foreign travel advice changes (FCDO)", True),
     ("drought", "Drought, reservoirs and hosepipe bans (England)", True),
     ("water", "Water supply problems near you (six water companies)", True),
-    ("floodrisk", "Flood risk forecast (England, Wales and Scotland)", True),
+    ("floodrisk", "Flood risk forecast (England and Scotland)", True),
     ("rain", "Rainfall near you (England, Scotland and Wales)", True),
     ("ground", "Groundwater near you (England)", False),
     ("gridnow", "The grid now: carbon and frequency (Great Britain)", False),
@@ -6909,8 +6910,9 @@ LIVE_CREDIT = {
     "drought": "The Environment Agency's weekly dry weather and drought report on GOV.UK, under the Open Government "
                "Licence",
     "water": "Reports from your water company's public 'in your area' map or page (not an official feed)",
-    "floodrisk": "The Flood Guidance Statement from the Flood Forecasting Centre (Environment Agency and Met Office), "
-                 "under the Open Government Licence; in Scotland, the Scottish Flood Forecast (SEPA and the Met Office)",
+    "floodrisk": "The Flood Forecasting Centre's five-day flood risk outlook (Environment Agency and Met Office), from "
+                 "GOV.UK's Check for flooding, under the Open Government Licence; in Scotland, the Scottish Flood Forecast "
+                 "(SEPA and the Met Office)",
     "rain": "Rain gauges from the Environment Agency (real-time data API, Beta), SEPA and Natural Resources Wales, under "
             "the Open Government Licence",
     "ground": "Environment Agency groundwater levels from the Hydrology API, under the Open Government Licence",
@@ -7913,28 +7915,68 @@ def fetch_drought(cfg, mem):
     return drought_live(cache[path], when, "https://www.gov.uk" + path, cfg, dt.datetime.now(dt.timezone.utc))
 
 
-# The flood risk forecast: five days for England and Wales from the Flood Forecasting Centre (Environment Agency and Met
-# Office), with Wales' own words for a home in Wales; three days for Scotland from the Scottish Flood Forecast (SEPA and
-# the Met Office). Northern Ireland has neither (SOURCE_COVERAGE).
-def floodrisk_live(st, wales=False):
-    head = plain(st.get("headline"), 300)
-    m = re.search(r"\b(VERY LOW|LOW|MEDIUM|HIGH)\b", head)
-    risk = m.group(1) if m else "VERY LOW"
-    trend = st.get("flood_risk_trend") if isinstance(st.get("flood_risk_trend"), dict) else {}
-    rising = any(str(v).lower() in ("increasing", "rising") for v in trend.values())
-    pf = st.get("public_forecast") if isinstance(st.get("public_forecast"), dict) else {}
-    text = plain((wales and pf.get("wales_forecast_english")) or pf.get("england_forecast") or head, 600)
-    when = parse_when(st.get("issued_at"))
-    reading = {"risk": risk, "headline": head, "text": text, "rising": rising, "issued": iso_utc(when),
-               "url": safe_url(st.get("pdf_url")) or "https://www.gov.uk/check-flooding", "days": 5,
-               "by": "Flood Forecasting Centre"}
+# The flood risk forecast: five days for England from the Flood Forecasting Centre (Environment Agency and Met Office),
+# as GOV.UK's Check for flooding publishes it; three days for Scotland from the Scottish Flood Forecast (SEPA and the Met
+# Office). The Flood Forecasting Centre's own open API closed in June 2026 (its new one needs a key), and Wales and
+# Northern Ireland have no open forecast just now (SOURCE_COVERAGE). The areas at risk are fetched whole and home is
+# checked against them here, so the forecast is for where you live and nothing about home is sent.
+OUTLOOK_RISK = {1: "VERY LOW", 2: "LOW", 3: "MEDIUM", 4: "HIGH"}
+
+
+def parse_outlook_page(data):
+    """From Check for flooding's front page: when the outlook was issued, its words, and each day's name."""
+    page = data.decode("utf-8", "replace") if isinstance(data, bytes) else str(data or "")
+    m = re.search(r'"outlookUTC"\s*:\s*"([^"]+)"', page)
+    issued = parse_when(m.group(1)) if m else None
+    names = {}
+    m = re.search(r"outlookDays\s*=\s*(\[.*?\])", page, re.S)
+    try:
+        for d in (json.loads(m.group(1)) if m else []):
+            when = parse_when(d.get("date")) if isinstance(d, dict) else None
+            if when and isinstance(d.get("idx"), int):
+                names[d["idx"]] = when.strftime("%A")
+    except ValueError:
+        names = {}
+    text = plain(re.sub(r"(?is)<script.*?</script>|<style.*?</style>", " ", page), 20000).replace("\n", " ")
+    m = re.search(r"Flood forecast for the next 5 days\s*(.*?)\s*(?:Updated at|Produced by|$)", text)
+    return issued, (plain(m.group(1), 600) if m else ""), names
+
+
+def floodrisk_live(page, areas, home):
+    issued, text, names = parse_outlook_page(page)
+    areas = _json(areas) if isinstance(areas, (bytes, bytearray)) else areas
+    feats = areas.get("features") if isinstance(areas, dict) else None
+    if not isinstance(feats, list):
+        raise ValueError("no flood risk outlook in the feed")
+    mine = {}
+    for f in feats:
+        props = f.get("properties") if isinstance(f, dict) else None
+        if not isinstance(props, dict) or not isinstance(props.get("risk-level"), int):
+            continue
+        g = f.get("geometry") if isinstance(f.get("geometry"), dict) else {}
+        coords = g.get("coordinates") or []
+        rings = [coords[0]] if g.get("type") == "Polygon" and coords else \
+            [p[0] for p in coords if p] if g.get("type") == "MultiPolygon" else []
+        if in_rings(rings, home["lat"], home["lon"]):
+            for d in props.get("days") or []:
+                if isinstance(d, int):
+                    mine[d] = max(mine.get(d, 1), props["risk-level"])
+    top = max(list(mine.values()) or [1])
+    risk = OUTLOOK_RISK.get(top, "VERY LOW")
+    first = min([d for d, v in mine.items() if v == top] or [1])
+    rising = top > mine.get(1, 1)   # higher later in the five days than today
+    when = names.get(first) or ("today" if first == 1 else "day %d" % first)
+    url = FEED_URLS["floodrisk"] if FEED_URLS["floodrisk"].startswith("https://") else "https://check-for-flooding.service.gov.uk/"
+    head = ("Flood risk %s where you live on %s" % (risk.lower(), when) if top > 1
+            else "Flood risk very low where you live for the next five days")
+    reading = {"risk": risk, "headline": head, "text": text or "No flooding is expected where you live.", "rising": rising,
+               "issued": iso_utc(issued), "url": url, "days": 5, "by": "Flood Forecasting Centre"}
     items = []
     if FGS_SEV.get(risk):
-        items.append({"id": "floodrisk:%s:%s" % (risk, (iso_utc(when) or "")[:10]), "source": "floodrisk",
+        items.append({"id": "floodrisk:%s:%s" % (risk, (iso_utc(issued) or "")[:10]), "source": "floodrisk",
                       "kind": "flood", "severity": FGS_SEV[risk], "level": risk.title() + " flood risk",
-                      "title": "Flood risk %s in the next five days" % risk.lower() + (", rising" if rising else ""),
-                      "text": text, "area": "Wales" if wales else "England and Wales", "when": "", "url": reading["url"],
-                      "issued": iso_utc(when)})
+                      "title": head, "text": reading["text"], "area": "Where you live", "when": "", "url": url,
+                      "issued": iso_utc(issued)})
     return items, reading
 
 
@@ -7975,17 +8017,11 @@ def sff_live(data):
 
 
 def fetch_floodrisk(home):
+    if not home:
+        raise NeedLocation()   # the forecast is for where you live
     if home_nation(home) == "scotland":
         return sff_live(http_get(FEED_URLS["sff"]))
-    return floodrisk_live(parse_floodrisk(http_get(FEED_URLS["floodrisk"], timeout=40)), wales=home_nation(home) == "wales")
-
-
-def parse_floodrisk(data):
-    d = _json(data)
-    st = (d.get("statements") or [d])[0] if isinstance(d, dict) else {}
-    if not isinstance(st, dict) or not st.get("headline"):
-        raise ValueError("no flood guidance statement in the feed")
-    return st
+    return floodrisk_live(http_get(FEED_URLS["floodrisk"]), http_get(FEED_URLS["floodrisk_areas"], timeout=40), home)
 
 
 # Rainfall near home: the nearest rain gauges, from the Environment Agency (England), SEPA (Scotland) and Natural Resources
@@ -9034,7 +9070,8 @@ SOURCE_COVERAGE = {
     "water": water_coverage,
     "floods": nation_coverage(GB, "There's no flood warning feed for Northern Ireland yet"),
     "rivers": nation_coverage(GB, "There's no river level feed for Northern Ireland yet"),
-    "floodrisk": nation_coverage(GB, "There's no flood risk forecast for Northern Ireland"),
+    "floodrisk": nation_coverage(("england", "scotland"), "There's no open flood risk forecast for Wales or Northern "
+                                                           "Ireland just now"),
     "rain": nation_coverage(GB, "No rain gauges for Northern Ireland yet (the Environment Agency, SEPA and Natural "
                                 "Resources Wales cover Great Britain)"),
     "ground": nation_coverage(("england",), "Only covers England (the Environment Agency's boreholes)"),

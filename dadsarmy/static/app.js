@@ -1662,9 +1662,12 @@
         'the company says your area is affected, or two are reported within 3 km, or one within 1 km.</p>';
     } else if (key === 'floodrisk') {
       var scot = r.days === 3;
-      h += '<p>Flood risk for the next ' + (scot ? 'three' : 'five') + ' days: <b>' + esc(String(r.word || r.risk || '').toLowerCase()) + '</b>' + (r.rising ? ', rising' : '') + '.</p>' + (r.text ? '<p class="small">' + esc(r.text) + '</p>' : '') +
-        '<p class="small muted">' + (scot ? 'The Scottish Flood Forecast, from SEPA and the Met Office. ' : 'The Flood Forecasting Centre\'s daily Flood Guidance Statement for England and Wales. ') +
-        (r.url ? '<a href="' + esc(r.url) + '" target="_blank" rel="noopener noreferrer">' + (scot ? 'The forecast' : 'The full statement') + '</a>.' : '') + '</p>';
+      h += (scot ? '<p>Flood risk for the next three days: <b>' + esc(String(r.word || r.risk || '').toLowerCase()) + '</b>.</p>'
+        : '<p><b>' + esc(r.headline || 'Flood risk ' + String(r.risk || '').toLowerCase() + ' where you live') + '</b>' + (r.rising ? ' (higher than today)' : '') + '.</p>') +
+        (r.text ? '<p class="small">' + esc(r.text) + '</p>' : '') +
+        '<p class="small muted">' + (scot ? 'The Scottish Flood Forecast, from SEPA and the Met Office. '
+          : 'The Flood Forecasting Centre\'s five-day outlook (Environment Agency and Met Office), from GOV.UK\'s Check for flooding. Home is checked against the areas at risk here, so it isn\'t sent. ') +
+        (r.url ? '<a href="' + esc(r.url) + '" target="_blank" rel="noopener noreferrer">' + (scot ? 'The forecast' : 'Check for flooding') + '</a>.' : '') + '</p>';
     } else if (key === 'rain') {
       h += r.day_mm != null ? '<p><b>' + esc(fq(r.day_mm)) + ' mm</b> in the last 24 hours, ' + esc(fq(Math.round(r.week_mm))) + ' mm in 7 days.</p>' +
         '<p class="small muted">Averaged over the nearest ' + (r.gauges || []).map(function (g) { return esc(g.name) + ' (' + esc(fq(g.km)) + ' km)'; }).join(', ') +

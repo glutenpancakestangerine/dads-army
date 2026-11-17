@@ -413,7 +413,7 @@ Under **More of the wider picture** in the warnings settings. All public; the ra
 | Travel advice (FCDO) | Countries whose advice changed in the last three days | Shown, but not a warning |
 | Drought, reservoirs and hosepipe bans (Environment Agency, England) | Reservoir storage, your area's drought status, your water company's hosepipe ban | Your area is in drought, or your water company has a hosepipe ban |
 | Water supply problems (six water companies) | Supply reports within 10 km | A supply problem that's yours: the company says your area is affected, or two are reported within 3 km, or one within 1 km |
-| Flood risk forecast (Flood Forecasting Centre for England and Wales, five days; Scottish Flood Forecast, three days) | The overall risk and whether it's rising | Medium or high (in Scotland: flooding possible, or significant flooding possible) |
+| Flood risk forecast (Flood Forecasting Centre's outlook for England, five days, from Check for flooding; Scottish Flood Forecast, three days) | The risk where you live, which day, and whether it's rising | Medium or high (in Scotland: flooding possible, or significant flooding possible) |
 | Rainfall near you (Environment Agency, SEPA, Natural Resources Wales) | Rain in 24 hours and 7 days at the nearest gauges (within 25 km) | 30 mm or more in a day |
 | Groundwater near you (Environment Agency, England) | The nearest boreholes (within 30 km) against the time of year; a deep borehole below sea level is marked, as it follows decades rather than this year's rain | Shown, but not a warning |
 | The grid now (NESO, Elexon) | Carbon intensity, the generation mix and the frequency | The frequency dips below 49.8 Hz |
@@ -423,7 +423,7 @@ Under **More of the wider picture** in the warnings settings. All public; the ra
 - **Water supply** covers Cambridge Water, South Staffs Water, Yorkshire Water, South West Water, Bournemouth Water and NI Water customers, the companies that publish their incidents this way. Choose yours in the warnings settings: it isn't guessed from where home is (the companies' areas are too tangled for that), except in Northern Ireland, where NI Water supplies everyone. For any other company it isn't fetched or shown, and its switch says why.
 - Not included: stock markets and commodity prices, as there's no free official source.
 
-Sources: the threat level, the FCDO's travel advice and the Environment Agency's drought reports on GOV.UK; the National Cyber Security Centre; the Flood Forecasting Centre's Flood Guidance Statement; Environment Agency rainfall (real-time data API) and groundwater (Hydrology API) data, all under the Open Government Licence; NESO's Carbon Intensity API (CC BY 4.0) and Data Portal; Elexon's BMRS; the regional providers below; and the water companies' public incident maps and pages.
+Sources: the threat level, the FCDO's travel advice and the Environment Agency's drought reports on GOV.UK; the National Cyber Security Centre; the Flood Forecasting Centre's five-day flood risk outlook (from GOV.UK's Check for flooding); Environment Agency rainfall (real-time data API) and groundwater (Hydrology API) data, all under the Open Government Licence; NESO's Carbon Intensity API (CC BY 4.0) and Data Portal; Elexon's BMRS; the regional providers below; and the water companies' public incident maps and pages.
 
 ### The rest of the UK
 
@@ -437,7 +437,6 @@ England's feeds stop at its borders. Where they don't reach, Scotland's, Wales' 
 | Rainfall | SEPA's rain gauges (KiWIS time series, hourly totals) | Open Government Licence | Scotland |
 | Rainfall | Natural Resources Wales' telemetry API (15-minute totals) | Open Government Licence | Wales |
 | Flood risk forecast | The Scottish Flood Forecast's RSS feed (SEPA and the Met Office) | Public feed | Scotland |
-| Flood risk forecast | The Flood Forecasting Centre's statement, with its Wales text | Open Government Licence | Wales (and England) |
 | Power cuts | Electricity North West: the list behind its power cut map | Not an official data feed | North West England |
 | Power cuts | NIE Networks: the list behind its PowerCheck map | Not an official data feed | Northern Ireland |
 | Power cuts | SP Energy Networks: no public live feed, so a note with its power cut map | | Central and southern Scotland, Merseyside, Cheshire and North Wales |
@@ -447,7 +446,7 @@ England's feeds stop at its borders. Where they don't reach, Scotland's, Wales' 
 | Which network | Great Britain's 14 electricity licence areas, from NESO's GIS boundaries (bundled, see `places/README.md`) | NESO Open Data Licence | Great Britain |
 
 - Which nation home is in comes from rough borders built in (a few km out near a border, which is why each feed reaches over it). Kintyre is Scotland.
-- **Not for your area:** a source that can't cover home isn't fetched, and its switch in the warnings settings says why, rather than showing as failing. In Northern Ireland: flood warnings, river levels, rainfall, the flood risk forecast, and the three grid sources (Northern Ireland's grid is run with Ireland's). Outside England: groundwater and the drought report.
+- **Not for your area:** a source that can't cover home isn't fetched, and its switch in the warnings settings says why, rather than showing as failing. In Northern Ireland: flood warnings, river levels, rainfall, the flood risk forecast, and the three grid sources (Northern Ireland's grid is run with Ireland's). In Wales: the flood risk forecast (there's no open one just now). Outside England: groundwater and the drought report.
 - The maps and pages that aren't official feeds could change without notice. If one does, that provider fails and says so; the others carry on.
 
 ## The daily briefing

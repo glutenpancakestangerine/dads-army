@@ -149,12 +149,9 @@ class ForecastTest(AppTest):
         items, r = server.sff_live(feeds.sff(minor=False))   # only the older, quiet one
         self.assertEqual((items, r["risk"], r["word"]), ([], "VERY LOW", "No flooding expected"))
 
-    def test_wales_gets_its_own_words(self):
-        st = {"headline": "The overall flood risk is LOW for the next five days.", "issued_at": NOW.isoformat(),
-              "public_forecast": {"england_forecast": "Minor flooding is possible in parts of England.",
-                                  "wales_forecast_english": "The flood risk across Wales is very low."}}
-        self.assertTrue(server.floodrisk_live(st, wales=True)[1]["text"].startswith("The flood risk across Wales"))
-        self.assertTrue(server.floodrisk_live(st)[1]["text"].startswith("Minor flooding is possible in parts of England"))
+    def test_no_open_forecast_for_wales(self):
+        covered, why = server.source_covers("floodrisk", {}, home(CARDIFF))
+        self.assertEqual((covered, "Wales" in why), (False, True))   # "Not for your area", not failing
 
 
 class PowerTest(AppTest):
@@ -260,7 +257,7 @@ class CoverageTest(AppTest):
     def test_sources_that_dont_reach_home(self):
         cfg = {"water_co": ""}
         limited = ("floods", "rivers", "floodrisk", "rain", "ground", "drought", "grid", "gridnow", "gridstress")
-        for p, off in ((BELFAST, set(limited)), (CARDIFF, {"ground", "drought"}), (GLASGOW, {"ground", "drought"}),
+        for p, off in ((BELFAST, set(limited)), (CARDIFF, {"floodrisk", "ground", "drought"}), (GLASGOW, {"ground", "drought"}),
                        (LONDON, set()), (None, set())):
             for key in limited + ("power", "air", "threat"):
                 covered, why = server.source_covers(key, cfg, home(p) if p else None)
